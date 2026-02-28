@@ -4,8 +4,11 @@
 // Source: mcp/plaud-mcp-server.js
 // Build command: npm run mcp:build-standalone
 
-import { readFileSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { exec } from "node:child_process";
+import { createServer } from "node:http";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 
 const { normalizeTranscriptionToTransResult } = (() => {
@@ -599,36 +602,33 @@ const TOOLS = [
   },
   {
     name: TOOL_AUTH_BROWSER,
-    description: "Auto-open PLAUD web app in browser and capture token from page storage.",
+    description: "Opens a local auth page in your browser to capture your PLAUD login token. Works on Windows, macOS, and Linux.",
     inputSchema: {
       type: "object",
       properties: {
-        browser: {
-          type: "string",
-          enum: ["chrome", "edge", "chromium"],
-          default: "chrome",
-          description: "Browser app used for automation (macOS only).",
-        },
-        open_url: {
+        open_browser: {
           type: "boolean",
           default: true,
-          description: "Whether to navigate to PLAUD page before extracting token.",
+          description: "Whether to automatically open the auth page in the default browser.",
         },
-        url: {
-          type: "string",
-          default: "https://web.plaud.ai/file/",
-          description: "Target PLAUD page URL.",
-        },
-        wait_ms: {
+        port: {
           type: "integer",
-          minimum: 1000,
-          maximum: 30000,
-          default: 7000,
-          description: "Wait time after opening page before extraction.",
+          minimum: 1024,
+          maximum: 65535,
+          default: 0,
+          description: "Port for the local auth server. 0 = auto-assign.",
         },
-        save_to_file: {
-          type: "string",
-          description: "Optional file path to persist token for reuse.",
+        timeout_ms: {
+          type: "integer",
+          minimum: 10000,
+          maximum: 300000,
+          default: 120000,
+          description: "How long to wait for token capture (ms). Default 2 minutes.",
+        },
+        persist: {
+          type: "boolean",
+          default: true,
+          description: "Save token to ~/.plaud/token for reuse across sessions.",
         },
         return_token: {
           type: "boolean",
@@ -719,145 +719,383 @@ function maskToken(token) {
   return `${raw.slice(0, 8)}...${raw.slice(-6)}`;
 }
 
-function toAppleScriptString(value) {
-  return `"${String(value || "")
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"')}"`;
+// --- Cross-platform auth: local HTTP callback server ---
+
+function getDefaultTokenPath() {
+  const dir = join(homedir(), ".plaud");
+  if (!existsSync(dir)) {
+    try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { /* ignore */ }
+  }
+  return join(dir, "token");
 }
 
-function resolveBrowserAppName(browser) {
-  const key = String(browser || "chrome")
-    .trim()
-    .toLowerCase();
-  if (key === "chrome") return "Google Chrome";
-  if (key === "edge") return "Microsoft Edge";
-  if (key === "chromium") return "Chromium";
-  throw new Error(`Unsupported browser: ${browser}`);
-}
-
-function buildBrowserTokenExtractorJs() {
-  return `(function () {
-  function safeJsonParse(text) {
-    try { return JSON.parse(text); } catch (_) { return null; }
-  }
-  function extractJwtFromString(value) {
-    var raw = String(value || "");
-    var match = raw.match(/eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}/);
-    return match && match[0] ? match[0] : "";
-  }
-  function findJwtInUnknownValue(value, depth) {
-    if (depth > 5) return "";
-    if (typeof value === "string") {
-      var direct = extractJwtFromString(value);
-      if (direct) return direct;
-      var parsed = safeJsonParse(value);
-      if (parsed) return findJwtInUnknownValue(parsed, depth + 1);
-      return "";
-    }
-    if (!value || typeof value !== "object") return "";
-    if (Array.isArray(value)) {
-      for (var i = 0; i < value.length; i += 1) {
-        var hitFromArray = findJwtInUnknownValue(value[i], depth + 1);
-        if (hitFromArray) return hitFromArray;
-      }
-      return "";
-    }
-    var keys = Object.keys(value);
-    for (var j = 0; j < keys.length; j += 1) {
-      var hit = findJwtInUnknownValue(value[keys[j]], depth + 1);
-      if (hit) return hit;
-    }
+function loadPersistedToken() {
+  const tokenPath = getDefaultTokenPath();
+  try {
+    const text = readFileSync(tokenPath, "utf8");
+    return normalizeToken(text);
+  } catch {
     return "";
   }
-  function findFromStorage(storage) {
-    try {
-      var keys = [];
-      for (var i = 0; i < storage.length; i += 1) {
-        var key = storage.key(i);
-        if (key) keys.push(key);
-      }
-      keys.sort(function (a, b) {
-        var al = String(a).toLowerCase();
-        var bl = String(b).toLowerCase();
-        var ah = al.indexOf("token") >= 0 || al.indexOf("auth") >= 0;
-        var bh = bl.indexOf("token") >= 0 || bl.indexOf("auth") >= 0;
-        if (ah !== bh) return ah ? -1 : 1;
-        return String(a).length - String(b).length;
-      });
-      for (var k = 0; k < keys.length; k += 1) {
-        var raw = storage.getItem(keys[k]);
-        if (!raw) continue;
-        var direct = extractJwtFromString(raw);
-        if (direct) return direct;
-        var parsed = safeJsonParse(raw);
-        if (parsed) {
-          var nested = findJwtInUnknownValue(parsed, 0);
-          if (nested) return nested;
-        }
-      }
-    } catch (_) {}
-    return "";
-  }
-  return (
-    findFromStorage(window.localStorage) ||
-    findFromStorage(window.sessionStorage) ||
-    extractJwtFromString(document.cookie) ||
-    ""
-  );
-})();`;
 }
 
-function runAppleScript(scriptText, timeoutMs) {
-  const result = spawnSync("osascript", ["-e", scriptText], {
-    encoding: "utf8",
-    timeout: timeoutMs,
+function persistToken(token) {
+  const tokenPath = getDefaultTokenPath();
+  try {
+    const dir = join(homedir(), ".plaud");
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(tokenPath, `${token}\n`, { encoding: "utf8", mode: 0o600 });
+    return tokenPath;
+  } catch (err) {
+    return "";
+  }
+}
+
+function openBrowserCrossPlatform(url) {
+  const platform = process.platform;
+  let cmd;
+  if (platform === "win32") {
+    cmd = `start "" "${url}"`;
+  } else if (platform === "darwin") {
+    cmd = `open "${url}"`;
+  } else {
+    cmd = `xdg-open "${url}"`;
+  }
+  return new Promise((resolve, reject) => {
+    exec(cmd, (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
   });
-  if (result.error) {
-    throw new Error(result.error.message || "Failed to run osascript");
-  }
-  if (result.status !== 0) {
-    const stderrText = String(result.stderr || "").trim();
-    const stdoutText = String(result.stdout || "").trim();
-    throw new Error(stderrText || stdoutText || `osascript exited with status ${result.status}`);
-  }
-  return String(result.stdout || "").trim();
 }
 
-function extractTokenViaBrowserAutomation({
-  browser = "chrome",
-  openUrl = true,
-  url = "https://web.plaud.ai/file/",
-  waitMs = 7000,
-} = {}) {
-  if (process.platform !== "darwin") {
-    throw new Error("Browser auto-auth currently supports macOS only.");
-  }
+function buildTokenExtractorSnippet(callbackPort) {
+  return `(function(){var t='';function scan(s){try{for(var i=0;i<s.length;i++){var k=s.key(i),v=s.getItem(k);var m=v.match(/eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}/);if(m)return m[0]}}catch(e){}return ''}t=scan(localStorage)||scan(sessionStorage);if(!t){var cm=document.cookie.match(/eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}/);if(cm)t=cm[0]}if(t){fetch('http://localhost:${callbackPort}/callback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})}).then(function(){document.title='Token captured!'}).catch(function(){prompt('Auto-send failed. Copy this token and paste it on the auth page:',t)})}else{alert('No PLAUD token found. Make sure you are logged in to web.plaud.ai first.')}})()`;
+}
 
-  const appName = resolveBrowserAppName(browser);
-  const safeUrl = String(url || "").trim() || "https://web.plaud.ai/file/";
-  const waitSeconds = Math.max(1, Math.ceil(waitMs / 1000));
-  const jsScript = buildBrowserTokenExtractorJs();
+function buildAuthPageHtml(callbackPort) {
+  const snippet = buildTokenExtractorSnippet(callbackPort);
+  const bookmarklet = `javascript:${encodeURIComponent(snippet)}`;
 
-  const lines = [];
-  if (openUrl) {
-    lines.push(`tell application ${toAppleScriptString(appName)}`);
-    lines.push("  activate");
-    lines.push("  if (count of windows) = 0 then make new window");
-    lines.push(`  set URL of active tab of front window to ${toAppleScriptString(safeUrl)}`);
-    lines.push("end tell");
-    lines.push(`delay ${waitSeconds}`);
-  }
-  lines.push(`tell application ${toAppleScriptString(appName)}`);
-  lines.push(
-    `  set tokenValue to execute active tab of front window javascript ${toAppleScriptString(jsScript)}`
-  );
-  lines.push("  if tokenValue is missing value then return \"\"");
-  lines.push("  return tokenValue");
-  lines.push("end tell");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PLAUD MCP — Authenticate</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; display: flex; justify-content: center; align-items: center; padding: 2rem; }
+  .card { background: #1e293b; border-radius: 16px; padding: 2.5rem; max-width: 640px; width: 100%; box-shadow: 0 25px 50px rgba(0,0,0,0.4); }
+  h1 { font-size: 1.5rem; margin-bottom: 0.5rem; color: #f8fafc; }
+  .subtitle { color: #94a3b8; margin-bottom: 2rem; font-size: 0.95rem; }
+  .step { background: #0f172a; border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem; border-left: 3px solid #3b82f6; }
+  .step-num { display: inline-block; background: #3b82f6; color: white; width: 28px; height: 28px; border-radius: 50%; text-align: center; line-height: 28px; font-size: 0.85rem; font-weight: 600; margin-right: 0.75rem; }
+  .step h3 { display: inline; font-size: 1rem; color: #f1f5f9; }
+  .step p { margin-top: 0.5rem; color: #94a3b8; font-size: 0.9rem; line-height: 1.5; }
+  a.btn { display: inline-block; background: #3b82f6; color: white; padding: 0.6rem 1.25rem; border-radius: 8px; text-decoration: none; font-weight: 500; margin-top: 0.5rem; transition: background 0.2s; }
+  a.btn:hover { background: #2563eb; }
+  a.btn-outline { background: transparent; border: 1px solid #475569; color: #cbd5e1; }
+  a.btn-outline:hover { border-color: #3b82f6; color: #3b82f6; }
+  .code-box { background: #020617; border: 1px solid #334155; border-radius: 8px; padding: 0.75rem 1rem; margin-top: 0.75rem; font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.8rem; color: #7dd3fc; word-break: break-all; cursor: pointer; position: relative; max-height: 80px; overflow-y: auto; }
+  .code-box:hover { border-color: #3b82f6; }
+  .copy-hint { position: absolute; top: 4px; right: 8px; font-size: 0.7rem; color: #475569; }
+  .divider { border: none; border-top: 1px solid #334155; margin: 1.5rem 0; }
+  .manual { background: #0f172a; border-radius: 12px; padding: 1.25rem; }
+  .manual h3 { font-size: 0.95rem; color: #f1f5f9; margin-bottom: 0.75rem; }
+  input[type="text"] { width: 100%; background: #020617; border: 1px solid #334155; border-radius: 8px; padding: 0.6rem 1rem; color: #e2e8f0; font-family: monospace; font-size: 0.85rem; margin-bottom: 0.75rem; }
+  input[type="text"]:focus { outline: none; border-color: #3b82f6; }
+  button { background: #3b82f6; color: white; border: none; padding: 0.6rem 1.25rem; border-radius: 8px; font-weight: 500; cursor: pointer; font-size: 0.9rem; }
+  button:hover { background: #2563eb; }
+  .status { margin-top: 1rem; padding: 0.75rem 1rem; border-radius: 8px; display: none; font-size: 0.9rem; }
+  .status.success { display: block; background: #052e16; border: 1px solid #166534; color: #4ade80; }
+  .status.error { display: block; background: #450a0a; border: 1px solid #991b1b; color: #fca5a5; }
+  .bookmarklet-area { margin-top: 0.75rem; }
+  .bookmarklet-link { display: inline-block; background: #7c3aed; color: white; padding: 0.5rem 1rem; border-radius: 8px; text-decoration: none; font-weight: 500; font-size: 0.85rem; cursor: grab; }
+  .bookmarklet-link:hover { background: #6d28d9; }
+  .hint { font-size: 0.8rem; color: #64748b; margin-top: 0.4rem; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>PLAUD MCP Authentication</h1>
+  <p class="subtitle">Connect your PLAUD account to your MCP client. Choose any method below.</p>
 
-  const stdout = runAppleScript(lines.join("\n"), waitMs + 20000);
-  const token = normalizeToken(stdout === "missing value" ? "" : stdout);
-  return { token, appName, url: safeUrl, openUrl, waitMs };
+  <div class="step">
+    <span class="step-num">1</span><h3>Open PLAUD</h3>
+    <p>Log in to your PLAUD account if you are not already logged in.</p>
+    <a href="https://web.plaud.ai/file/" target="_blank" class="btn" style="margin-top: 0.75rem;">Open PLAUD Web App &rarr;</a>
+  </div>
+
+  <div class="step">
+    <span class="step-num">2</span><h3>Extract Token (Option A — Console Snippet)</h3>
+    <p>While on <strong>web.plaud.ai</strong>, press <strong>F12</strong> to open DevTools, go to the <strong>Console</strong> tab, and paste this:</p>
+    <div class="code-box" id="snippet" onclick="copySnippet()">${snippet}<span class="copy-hint">click to copy</span></div>
+    <p class="hint">This extracts your login token and sends it back here automatically.</p>
+  </div>
+
+  <div class="step">
+    <span class="step-num">2</span><h3>Extract Token (Option B — Bookmarklet)</h3>
+    <p>Drag this button to your bookmarks bar. Then click it while on web.plaud.ai:</p>
+    <div class="bookmarklet-area">
+      <a href="${bookmarklet}" class="bookmarklet-link" onclick="event.preventDefault(); alert('Drag this to your bookmarks bar, then click it while on web.plaud.ai');">&#x1f50d; Extract PLAUD Token</a>
+    </div>
+    <p class="hint">One-time setup — works for future sessions too.</p>
+  </div>
+
+  <hr class="divider">
+
+  <div class="manual">
+    <h3>Manual Token Entry</h3>
+    <p style="color: #94a3b8; font-size: 0.85rem; margin-bottom: 0.75rem;">If the above methods do not work, paste your PLAUD bearer token here:</p>
+    <input type="text" id="tokenInput" placeholder="eyJhbGciOi..." />
+    <button onclick="submitToken()">Submit Token</button>
+  </div>
+
+  <div id="status" class="status"></div>
+</div>
+
+<script>
+function copySnippet() {
+  var text = document.getElementById('snippet').innerText.replace('click to copy', '').trim();
+  navigator.clipboard.writeText(text).then(function() {
+    var el = document.querySelector('.copy-hint');
+    el.textContent = 'copied!';
+    setTimeout(function() { el.textContent = 'click to copy'; }, 2000);
+  });
+}
+
+function showStatus(msg, ok) {
+  var el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = 'status ' + (ok ? 'success' : 'error');
+}
+
+function submitToken() {
+  var token = document.getElementById('tokenInput').value.trim();
+  if (!token) { showStatus('Please paste a token first.', false); return; }
+  fetch('/callback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: token })
+  }).then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.ok) showStatus('Token captured successfully! You can close this tab.', true);
+      else showStatus('Error: ' + (d.error || 'Unknown'), false);
+    })
+    .catch(function(e) { showStatus('Failed to send token: ' + e.message, false); });
+}
+
+// Listen for auto-callback success
+var pollId = setInterval(function() {
+  fetch('/status').then(function(r) { return r.json(); }).then(function(d) {
+    if (d.captured) {
+      clearInterval(pollId);
+      showStatus('Token captured successfully! You can close this tab.', true);
+    }
+  }).catch(function() {});
+}, 2000);
+</script>
+</body>
+</html>`;
+}
+
+function startAuthServer({ port = 0, timeoutMs = 120000 } = {}) {
+  return new Promise((resolve, reject) => {
+    let captured = false;
+    let capturedToken = "";
+    let serverRef = null;
+    let timeoutHandle = null;
+
+    const cleanup = () => {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (serverRef) {
+        try { serverRef.close(); } catch { /* ignore */ }
+      }
+    };
+
+    serverRef = createServer((req, res) => {
+      const actualPort = serverRef.address()?.port || port;
+      const reqUrl = new URL(req.url || "/", "http://localhost:" + actualPort);
+
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+      if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
+      if (reqUrl.pathname === "/" || reqUrl.pathname === "/auth") {
+        const html = buildAuthPageHtml(actualPort);
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(html);
+        return;
+      }
+
+      if (reqUrl.pathname === "/status") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ captured }));
+        return;
+      }
+
+      if (reqUrl.pathname === "/callback" && req.method === "POST") {
+        let body = "";
+        req.on("data", (chunk) => { body += chunk; });
+        req.on("end", () => {
+          try {
+            const data = JSON.parse(body);
+            const token = normalizeToken(data?.token);
+            if (!token) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ ok: false, error: "No valid token received" }));
+              return;
+            }
+            capturedToken = token;
+            captured = true;
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true, masked: maskToken(token) }));
+
+            setTimeout(() => {
+              cleanup();
+              resolve({ token: capturedToken, source: "auth_server" });
+            }, 500);
+          } catch (err) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "Invalid request body" }));
+          }
+        });
+        return;
+      }
+
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not found" }));
+    });
+
+    serverRef.listen(port, "127.0.0.1", () => {
+      const actualPort = serverRef.address()?.port;
+      process.stderr.write("Auth server listening on http://localhost:" + actualPort + "\n");
+    });
+
+    serverRef.on("error", (err) => {
+      cleanup();
+      reject(new Error("Auth server failed to start: " + err.message));
+    });
+
+    timeoutHandle = setTimeout(() => {
+      cleanup();
+      if (!captured) {
+        reject(new Error("Auth timed out after " + Math.round(timeoutMs / 1000) + " seconds. Please try again."));
+      }
+    }, timeoutMs);
+  });
+}
+
+function startAuthServerWithBrowser({ port = 0, timeoutMs = 120000, openBrowser = true } = {}) {
+  return new Promise((resolve, reject) => {
+    let captured = false;
+    let capturedToken = "";
+    let serverRef = null;
+    let timeoutHandle = null;
+
+    const cleanup = () => {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (serverRef) {
+        try { serverRef.close(); } catch { /* ignore */ }
+      }
+    };
+
+    serverRef = createServer((req, res) => {
+      const actualPort = serverRef.address()?.port || port;
+      const reqUrl = new URL(req.url || "/", "http://localhost:" + actualPort);
+
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+      if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
+      if (reqUrl.pathname === "/" || reqUrl.pathname === "/auth") {
+        const html = buildAuthPageHtml(actualPort);
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(html);
+        return;
+      }
+
+      if (reqUrl.pathname === "/status") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ captured }));
+        return;
+      }
+
+      if (reqUrl.pathname === "/callback" && req.method === "POST") {
+        let body = "";
+        req.on("data", (chunk) => { body += chunk; });
+        req.on("end", () => {
+          try {
+            const data = JSON.parse(body);
+            const token = normalizeToken(data?.token);
+            if (!token) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ ok: false, error: "No valid token received" }));
+              return;
+            }
+            capturedToken = token;
+            captured = true;
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true, masked: maskToken(token) }));
+
+            setTimeout(() => {
+              cleanup();
+              resolve({ token: capturedToken, source: "auth_server" });
+            }, 500);
+          } catch (err) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "Invalid request body" }));
+          }
+        });
+        return;
+      }
+
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not found" }));
+    });
+
+    serverRef.listen(port, "127.0.0.1", async () => {
+      const actualPort = serverRef.address()?.port;
+      const authUrl = "http://localhost:" + actualPort;
+      process.stderr.write("Auth server listening on " + authUrl + "\n");
+
+      if (openBrowser) {
+        try {
+          await openBrowserCrossPlatform(authUrl);
+          process.stderr.write("Opened browser to " + authUrl + "\n");
+        } catch (err) {
+          process.stderr.write("Could not open browser automatically: " + err.message + "\nPlease open " + authUrl + " manually.\n");
+        }
+      } else {
+        process.stderr.write("Open " + authUrl + " in your browser to authenticate.\n");
+      }
+    });
+
+    serverRef.on("error", (err) => {
+      cleanup();
+      reject(new Error("Auth server failed to start: " + err.message));
+    });
+
+    timeoutHandle = setTimeout(() => {
+      cleanup();
+      if (!captured) {
+        reject(new Error("Auth timed out after " + Math.round(timeoutMs / 1000) + " seconds. Please try again."));
+      }
+    }, timeoutMs);
+  });
 }
 
 function formatDateFromSessionId(sessionId) {
@@ -1336,13 +1574,19 @@ function resolvePlaudToken() {
   if (directToken) return directToken;
 
   const tokenFile = String(process.env.PLAUD_TOKEN_FILE || "").trim();
-  if (!tokenFile) return "";
-  try {
-    const text = readFileSync(tokenFile, "utf8");
-    return normalizeToken(text);
-  } catch {
-    return "";
+  if (tokenFile) {
+    try {
+      const text = readFileSync(tokenFile, "utf8");
+      const fileToken = normalizeToken(text);
+      if (fileToken) return fileToken;
+    } catch { /* ignore */ }
   }
+
+  // Check default persisted token location (~/.plaud/token)
+  const persistedToken = loadPersistedToken();
+  if (persistedToken) return persistedToken;
+
+  return "";
 }
 
 function resolvePlaudTokenSource() {
@@ -1355,6 +1599,7 @@ function resolvePlaudTokenSource() {
     return "env";
   }
   if (String(process.env.PLAUD_TOKEN_FILE || "").trim()) return "token_file";
+  if (loadPersistedToken()) return "persisted_file";
   return "";
 }
 
@@ -1381,33 +1626,41 @@ function getPlaudClient() {
 }
 
 async function handleAuthBrowser(args) {
-  const browser = String(args?.browser || "chrome")
-    .trim()
-    .toLowerCase();
-  const openUrl = toBoolean(args?.open_url, true);
-  const targetUrl = String(args?.url || "https://web.plaud.ai/file/").trim();
-  const waitMs = clampInteger(args?.wait_ms, { defaultValue: 7000, min: 1000, max: 30000 });
-  const saveToFile = String(args?.save_to_file || "").trim();
+  const openBrowser = toBoolean(args?.open_browser, true);
+  const port = clampInteger(args?.port, { defaultValue: 0, min: 0, max: 65535 });
+  const timeoutMs = clampInteger(args?.timeout_ms, { defaultValue: 120000, min: 10000, max: 300000 });
+  const shouldPersist = toBoolean(args?.persist, true);
   const returnToken = toBoolean(args?.return_token, false);
 
-  const result = extractTokenViaBrowserAutomation({
-    browser,
-    openUrl,
-    url: targetUrl,
-    waitMs,
-  });
+  // Check for persisted token first
+  const persisted = loadPersistedToken();
+  if (persisted) {
+    setRuntimePlaudToken(persisted, "persisted_file");
+    return {
+      ok: true,
+      token_loaded: true,
+      token_source: "persisted_file",
+      token_masked: maskToken(persisted),
+      token_path: getDefaultTokenPath(),
+      method: "persisted",
+      return_token: returnToken,
+      token: returnToken ? persisted : "",
+    };
+  }
+
+  // Start local auth server and open browser
+  const result = await startAuthServerWithBrowser({ port, timeoutMs, openBrowser });
 
   const token = normalizeToken(result?.token);
   if (!token) {
-    throw new Error(
-      "No PLAUD token captured. Please ensure browser is logged in, keep web.plaud.ai open, and retry."
-    );
+    throw new Error("No PLAUD token was captured. Please try again.");
   }
 
-  setRuntimePlaudToken(token, `browser:${result.appName}`);
+  setRuntimePlaudToken(token, "auth_server");
 
-  if (saveToFile) {
-    writeFileSync(saveToFile, `${token}\n`, { encoding: "utf8", mode: 0o600 });
+  let savedPath = "";
+  if (shouldPersist) {
+    savedPath = persistToken(token);
   }
 
   return {
@@ -1415,11 +1668,9 @@ async function handleAuthBrowser(args) {
     token_loaded: true,
     token_source: resolvePlaudTokenSource(),
     token_masked: maskToken(token),
-    browser: browser,
-    browser_app: result.appName,
-    opened_url: result.openUrl ? result.url : "",
-    wait_ms: waitMs,
-    saved_to_file: saveToFile || "",
+    token_path: savedPath,
+    method: "auth_server",
+    platform: process.platform,
     return_token: returnToken,
     token: returnToken ? token : "",
   };
