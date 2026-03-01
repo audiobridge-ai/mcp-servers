@@ -8,7 +8,7 @@ It explains how to use this MCP in Claude Code to access PLAUD files, transcript
 After setup, Claude can use these MCP tools:
 
 - `plaud_auth_browser`
-  - Opens PLAUD in your browser and tries to capture your login token automatically (macOS).
+  - Opens PLAUD in your browser and tries to capture your login token automatically (macOS/Windows).
 - `plaud_list_files`
   - Lists your PLAUD files.
 - `plaud_get_file_data`
@@ -81,6 +81,7 @@ claude mcp add --scope user -e PLAUD_TOKEN=YOUR_TOKEN plaud-local -- node /absol
 - Make sure you are logged in at `https://web.plaud.ai/file/`
 - Increase `wait_ms` to `15000`
 - On macOS, allow Terminal/iTerm to control your browser when prompted
+- On Windows, if capture still fails, fully close the target browser once and retry
 
 3. `Missing PLAUD token`
 - Run `plaud_auth_browser` first

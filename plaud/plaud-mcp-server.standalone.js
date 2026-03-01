@@ -4,52 +4,53 @@
 // Source: mcp/plaud-mcp-server.js
 // Build command: npm run mcp:build-standalone
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 
 const { normalizeTranscriptionToTransResult } = (() => {
   function normalizeSpeaker(value) {
     if (value == null) return "Speaker 1";
-
+  
     if (typeof value === "number" && Number.isFinite(value)) {
       return `Speaker ${Math.max(1, Math.round(value))}`;
     }
-
+  
     const raw = String(value || "").trim();
     if (!raw) return "Speaker 1";
-
+  
     let m = raw.match(/^Speaker\s*(\d+)$/i) || raw.match(/^speaker\s*(\d+)$/i);
     if (m?.[1]) {
       const n = Number.parseInt(m[1], 10);
       if (Number.isFinite(n)) return `Speaker ${Math.max(1, n)}`;
     }
-
+  
     m = raw.match(/^SPEAKER\s*(\d+)$/i) || raw.match(/^SPEAKER(\d+)$/i);
     if (m?.[1]) {
       const n = Number.parseInt(m[1], 10);
       if (Number.isFinite(n)) return `Speaker ${Math.max(1, n)}`;
     }
-
+  
     m = raw.match(/^SPEAKER[_\s-]*(\d+)$/i) || raw.match(/^speaker[_\s-]*(\d+)$/i);
     if (m?.[1]) {
       const idx0 = Number.parseInt(m[1], 10);
       if (Number.isFinite(idx0)) return `Speaker ${Math.max(1, idx0 + 1)}`;
     }
-
+  
     m = raw.match(/(\d+)/);
     if (m?.[1]) {
       const n = Number.parseInt(m[1], 10);
       if (Number.isFinite(n)) return `Speaker ${Math.max(1, n)}`;
     }
-
+  
     return raw;
   }
 
   const SPEAKER_SEGMENT_MIN_MS = 10_000;
   const SPEAKER_SEGMENT_MAX_MS = 20_000;
   const SPEAKER_SEGMENT_SOFT_MAX_MS = 22_000;
-
+  
   function safeJsonParse(text) {
     try {
       return JSON.parse(text);
@@ -57,7 +58,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
       return null;
     }
   }
-
+  
   function shouldUseRawFallback(value) {
     const raw = String(value || "").trim();
     if (!raw) return false;
@@ -67,37 +68,37 @@ const { normalizeTranscriptionToTransResult } = (() => {
     }
     return true;
   }
-
+  
   function pickNonEmptyString(...values) {
     for (const v of values) {
       if (typeof v === "string" && v.trim()) return v.trim();
     }
     return "";
   }
-
+  
   function toMs(value) {
     const n = Number(value);
     if (!Number.isFinite(n)) return 0;
     if (n <= 0) return 0;
-
+  
     if (n > 24 * 60 * 60 * 1000) return Math.round(n);
     return Math.round(n * 1000);
   }
-
+  
   function normalizeSegmentTimingMs(value, unit) {
     const n = Number(value);
     if (!Number.isFinite(n)) return 0;
     if (unit === "sec") return Math.round(n * 1000);
     return Math.round(n);
   }
-
+  
   function joinSegmentTexts(texts) {
     return String(texts.join(" ") || "")
       .replace(/\s+([,.!?;:])/g, "$1")
       .replace(/\s+/g, " ")
       .trim();
   }
-
+  
   function buildSpeakerSegmentsFromItems(items, options) {
     const list = Array.isArray(items) ? items : [];
     const minMs = options?.minMs ?? SPEAKER_SEGMENT_MIN_MS;
@@ -105,7 +106,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
     const softMaxMs = options?.softMaxMs ?? SPEAKER_SEGMENT_SOFT_MAX_MS;
     const out = [];
     let current = null;
-
+  
     const flush = () => {
       if (!current?.texts?.length) return;
       const content = joinSegmentTexts(current.texts);
@@ -118,7 +119,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
         embeddingKey: null,
       });
     };
-
+  
     for (const item of list) {
       if (!item) continue;
       const text = String(item.text || "").trim();
@@ -126,50 +127,50 @@ const { normalizeTranscriptionToTransResult } = (() => {
       const speaker = normalizeSpeaker(item.speaker);
       const startMs = Number.isFinite(item.startMs) ? item.startMs : 0;
       const endMs = Number.isFinite(item.endMs) ? item.endMs : 0;
-
+  
       if (!current) {
         current = { speaker, startMs, endMs, texts: [text] };
         continue;
       }
-
+  
       if (speaker !== current.speaker) {
         flush();
         current = { speaker, startMs, endMs, texts: [text] };
         continue;
       }
-
+  
       const currentDuration =
         current.endMs > current.startMs ? current.endMs - current.startMs : 0;
       const nextEnd = Math.max(current.endMs, endMs);
       const nextDuration =
         nextEnd > current.startMs ? nextEnd - current.startMs : currentDuration;
-
+  
       if (!current.endMs || !endMs) {
         current.texts.push(text);
         current.endMs = nextEnd || current.endMs;
         continue;
       }
-
+  
       if (nextDuration <= maxMs) {
         current.texts.push(text);
         current.endMs = nextEnd;
         continue;
       }
-
+  
       if (currentDuration < minMs && nextDuration <= softMaxMs) {
         current.texts.push(text);
         current.endMs = nextEnd;
         continue;
       }
-
+  
       flush();
       current = { speaker, startMs, endMs, texts: [text] };
     }
-
+  
     flush();
     return out;
   }
-
+  
   function normalizeZeroBasedSpeakerLabel(value) {
     if (value == null) return "Speaker 1";
     if (typeof value === "number" && Number.isFinite(value)) {
@@ -183,7 +184,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
     }
     return value;
   }
-
+  
   function buildSegmentsFromUtterances(utterances, unit, options = {}) {
     const list = Array.isArray(utterances) ? utterances : [];
     const items = [];
@@ -204,7 +205,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
     }
     return buildSpeakerSegmentsFromItems(items);
   }
-
+  
   function pickWordText(word) {
     return pickNonEmptyString(
       word?.punctuated_word,
@@ -214,7 +215,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
       word?.content
     );
   }
-
+  
   function buildSegmentsFromWords(words, unit, options = {}) {
     const list = Array.isArray(words) ? words : [];
     const items = [];
@@ -235,22 +236,22 @@ const { normalizeTranscriptionToTransResult } = (() => {
     }
     return buildSpeakerSegmentsFromItems(items);
   }
-
+  
   function normalizeTranscriptionToTransResult(data) {
     const root = data ?? {};
-
+  
     const normalizeFromList = (list) => {
       if (!Array.isArray(list)) return null;
-
+  
       const out = [];
       for (const item of list) {
         if (!item || typeof item !== "object") continue;
-
+  
         const content = String(
           item?.content ?? item?.text ?? item?.transcript ?? ""
         ).trim();
         if (!content) continue;
-
+  
         const startMs = Number(item?.start_time ?? item?.startTime ?? 0);
         const endMs = Number(item?.end_time ?? item?.endTime ?? 0);
         out.push({
@@ -268,18 +269,18 @@ const { normalizeTranscriptionToTransResult } = (() => {
           embeddingKey: null,
         });
       }
-
+  
       return out.length ? out : null;
     };
-
+  
     const directRootList = normalizeFromList(Array.isArray(root) ? root : null);
     if (directRootList) return directRootList;
-
+  
     const directDataList = normalizeFromList(
       Array.isArray(root?.data) ? root.data : null
     );
     if (directDataList) return directDataList;
-
+  
     const directTransResult =
       (Array.isArray(root?.trans_result) && root.trans_result) ||
       (Array.isArray(root?.data?.trans_result) && root.data.trans_result) ||
@@ -289,7 +290,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
       for (const item of directTransResult) {
         const content = String(item?.content ?? item?.text ?? "").trim();
         if (!content) continue;
-
+  
         const startMs = Number(item?.start_time ?? item?.startTime ?? 0);
         const endMs = Number(item?.end_time ?? item?.endTime ?? 0);
         out.push({
@@ -309,12 +310,12 @@ const { normalizeTranscriptionToTransResult } = (() => {
       }
       if (out.length) return out;
     }
-
+  
     const segments =
       (Array.isArray(root?.segments) && root.segments) ||
       (Array.isArray(root?.data?.segments) && root.data.segments) ||
       null;
-
+  
     if (segments) {
       const out = [];
       for (const seg of segments) {
@@ -322,7 +323,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
           seg?.text ?? seg?.content ?? seg?.transcript ?? ""
         ).trim();
         if (!content) continue;
-
+  
         out.push({
           content,
           end_time: toMs(seg?.end ?? seg?.end_time ?? seg?.endTime),
@@ -339,7 +340,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
       }
       if (out.length) return out;
     }
-
+  
     const utterances =
       (Array.isArray(root?.utterances) && root.utterances) ||
       (Array.isArray(root?.data?.utterances) && root.data.utterances) ||
@@ -362,7 +363,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
       }
       if (out.length) return out;
     }
-
+  
     const words =
       (Array.isArray(root?.words) && root.words) ||
       (Array.isArray(root?.data?.words) && root.data.words) ||
@@ -394,7 +395,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
         ];
       }
     }
-
+  
     const rawFallback = pickNonEmptyString(root?.raw, root?.data?.raw);
     if (shouldUseRawFallback(rawFallback)) {
       return [
@@ -407,7 +408,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
         },
       ];
     }
-
+  
     const text = pickNonEmptyString(
       root?.text,
       root?.transcript,
@@ -416,9 +417,9 @@ const { normalizeTranscriptionToTransResult } = (() => {
       root?.data?.transcript,
       root?.data?.output_text
     );
-
+  
     if (!text) return [];
-
+  
     return [
       {
         content: text,
@@ -429,13 +430,13 @@ const { normalizeTranscriptionToTransResult } = (() => {
       },
     ];
   }
-
+  
   function normalizeAssemblyAiTranscript(transcript) {
     const utterances = Array.isArray(transcript?.utterances)
       ? transcript.utterances
       : null;
     const words = Array.isArray(transcript?.words) ? transcript.words : null;
-
+  
     if (utterances?.length) {
       const merged = buildSegmentsFromUtterances(utterances, "ms", {
         zeroBasedSpeakers: true,
@@ -452,17 +453,17 @@ const { normalizeTranscriptionToTransResult } = (() => {
         return merged;
       }
     }
-
+  
     if (words?.length) {
       const wordSegments = buildSegmentsFromWords(words, "ms", {
         zeroBasedSpeakers: true,
       });
       if (wordSegments.length) return wordSegments;
     }
-
+  
     return normalizeTranscriptionToTransResult(transcript);
   }
-
+  
   function normalizeDeepgramTranscript(transcript) {
     const utterances = Array.isArray(transcript?.results?.utterances)
       ? transcript.results.utterances
@@ -472,21 +473,21 @@ const { normalizeTranscriptionToTransResult } = (() => {
     )
       ? transcript.results.channels[0].alternatives[0].words
       : null;
-
+  
     if (utterances?.length) {
       const merged = buildSegmentsFromUtterances(utterances, "sec", {
         zeroBasedSpeakers: true,
       });
       if (merged.length) return merged;
     }
-
+  
     if (words?.length) {
       const wordSegments = buildSegmentsFromWords(words, "sec", {
         zeroBasedSpeakers: true,
       });
       if (wordSegments.length) return wordSegments;
     }
-
+  
     return normalizeTranscriptionToTransResult(transcript);
   }
 
@@ -495,8 +496,8 @@ const { normalizeTranscriptionToTransResult } = (() => {
 
 const SERVER_NAME = "plaud-local-mcp";
 const SERVER_VERSION = "0.1.0";
-const DEFAULT_PROTOCOL_VERSION = "2025-11-25";
-const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2025-11-25", "2024-11-05", "2024-10-07"]);
+const DEFAULT_PROTOCOL_VERSION = "2024-11-05";
+const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2024-11-05", "2024-10-07"]);
 const DEFAULT_API_ORIGIN = "https://api.plaud.ai";
 
 const TOOL_LIST_FILES = "plaud_list_files";
@@ -607,7 +608,7 @@ const TOOLS = [
           type: "string",
           enum: ["chrome", "edge", "chromium"],
           default: "chrome",
-          description: "Browser app used for automation (macOS only).",
+          description: "Browser app used for automation (macOS/Windows).",
         },
         open_url: {
           type: "boolean",
@@ -725,6 +726,252 @@ function toAppleScriptString(value) {
     .replace(/"/g, '\\"')}"`;
 }
 
+function decodeBase64UrlUtf8(value) {
+  try {
+    const raw = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
+    if (!raw) return "";
+    const padding = raw.length % 4;
+    const padded = padding ? `${raw}${"=".repeat(4 - padding)}` : raw;
+    return Buffer.from(padded, "base64").toString("utf8");
+  } catch {
+    return "";
+  }
+}
+
+function tryParseJwtPayload(token) {
+  const raw = String(token || "");
+  const parts = raw.split(".");
+  if (parts.length < 2) return null;
+  const payloadText = decodeBase64UrlUtf8(parts[1]);
+  if (!payloadText) return null;
+  return safeJsonParse(payloadText);
+}
+
+function scoreWindowsTokenCandidate(token, contextText, filePath) {
+  const context = String(contextText || "").toLowerCase();
+  const file = String(filePath || "").toLowerCase();
+  let score = 0;
+
+  if (context.includes("plaud")) score += 12;
+  if (context.includes("web.plaud.ai")) score += 8;
+  if (context.includes("token")) score += 4;
+  if (context.includes("auth")) score += 3;
+  if (context.includes("bearer")) score += 2;
+  if (file.includes("\\default\\") || file.includes("/default/")) score += 1;
+
+  const payload = tryParseJwtPayload(token);
+  if (payload && typeof payload === "object") {
+    score += 2;
+    const payloadText = JSON.stringify(payload).toLowerCase();
+    if (payloadText.includes("plaud")) score += 6;
+    const exp = Number(payload?.exp);
+    if (Number.isFinite(exp)) {
+      if (exp * 1000 > Date.now()) score += 2;
+      else score -= 2;
+    }
+  }
+
+  return score;
+}
+
+function collectWindowsJwtCandidatesFromLevelDb(levelDbDir) {
+  let entries = [];
+  try {
+    entries = readdirSync(levelDbDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    if (!/\.(log|ldb)$/i.test(entry.name)) continue;
+
+    const filePath = join(levelDbDir, entry.name);
+    let text = "";
+    try {
+      const content = readFileSync(filePath);
+      if (!content || content.length === 0) continue;
+      const maxBytes = 12 * 1024 * 1024;
+      text = content.length > maxBytes
+        ? content.subarray(0, maxBytes).toString("latin1")
+        : content.toString("latin1");
+    } catch {
+      continue;
+    }
+
+    const jwtRegex = /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g;
+    let match = null;
+    while ((match = jwtRegex.exec(text)) !== null) {
+      const token = normalizeToken(match[0]);
+      if (!token) continue;
+      const start = Math.max(0, match.index - 160);
+      const end = Math.min(text.length, match.index + token.length + 160);
+      const contextText = text.slice(start, end);
+      candidates.push({
+        token,
+        score: scoreWindowsTokenCandidate(token, contextText, filePath),
+      });
+    }
+  }
+
+  return candidates;
+}
+
+function listWindowsProfileLevelDbDirs(userDataDir) {
+  let entries = [];
+  try {
+    entries = readdirSync(userDataDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const profiles = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .filter(
+      (name) => name === "Default" || name === "Guest Profile" || /^Profile \d+$/i.test(name)
+    )
+    .sort((a, b) => {
+      if (a === "Default" && b !== "Default") return -1;
+      if (b === "Default" && a !== "Default") return 1;
+      return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+    });
+
+  return profiles.map((name) => join(userDataDir, name, "Local Storage", "leveldb"));
+}
+
+function resolveWindowsBrowserConfig(browser) {
+  const key = String(browser || "chrome")
+    .trim()
+    .toLowerCase();
+  const localAppData = String(process.env.LOCALAPPDATA || "").trim();
+  const programFiles = String(process.env.ProgramFiles || "C:\\Program Files").trim();
+  const programFilesX86 = String(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)").trim();
+
+  if (!localAppData) {
+    throw new Error("LOCALAPPDATA is not available. Cannot inspect browser profile.");
+  }
+
+  if (key === "chrome") {
+    return {
+      appName: "Google Chrome",
+      userDataDir: join(localAppData, "Google", "Chrome", "User Data"),
+      executableCandidates: [
+        join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
+        join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
+        join(localAppData, "Google", "Chrome", "Application", "chrome.exe"),
+      ],
+    };
+  }
+
+  if (key === "edge") {
+    return {
+      appName: "Microsoft Edge",
+      userDataDir: join(localAppData, "Microsoft", "Edge", "User Data"),
+      executableCandidates: [
+        join(programFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
+        join(programFilesX86, "Microsoft", "Edge", "Application", "msedge.exe"),
+        join(localAppData, "Microsoft", "Edge", "Application", "msedge.exe"),
+      ],
+    };
+  }
+
+  if (key === "chromium") {
+    return {
+      appName: "Chromium",
+      userDataDir: join(localAppData, "Chromium", "User Data"),
+      executableCandidates: [
+        join(programFiles, "Chromium", "Application", "chrome.exe"),
+        join(programFilesX86, "Chromium", "Application", "chrome.exe"),
+        join(localAppData, "Chromium", "Application", "chrome.exe"),
+      ],
+    };
+  }
+
+  throw new Error(`Unsupported browser: ${browser}`);
+}
+
+function openWindowsBrowserUrl(browser, url) {
+  const config = resolveWindowsBrowserConfig(browser);
+  const safeUrl = String(url || "").trim();
+  const candidates = Array.from(new Set(config.executableCandidates.filter(Boolean)));
+
+  for (const executable of candidates) {
+    const result = spawnSync(executable, [safeUrl], {
+      encoding: "utf8",
+      timeout: 8000,
+      windowsHide: true,
+    });
+    if (!result.error && result.status === 0) return;
+  }
+
+  const fallback = spawnSync("cmd.exe", ["/c", "start", "", safeUrl], {
+    encoding: "utf8",
+    timeout: 8000,
+    windowsHide: true,
+  });
+  if (fallback.error) {
+    throw new Error(fallback.error.message || "Failed to open browser on Windows");
+  }
+  if (fallback.status !== 0) {
+    const stderrText = String(fallback.stderr || "").trim();
+    const stdoutText = String(fallback.stdout || "").trim();
+    throw new Error(stderrText || stdoutText || `cmd start failed with status ${fallback.status}`);
+  }
+}
+
+function sleepMs(timeoutMs) {
+  const waitMs = Math.max(0, Math.floor(Number(timeoutMs) || 0));
+  if (!waitMs) return;
+  const lock = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(lock, 0, 0, waitMs);
+}
+
+function extractTokenViaWindowsStorage({
+  browser = "chrome",
+  openUrl = true,
+  url = "https://web.plaud.ai/file/",
+  waitMs = 7000,
+} = {}) {
+  const config = resolveWindowsBrowserConfig(browser);
+  const safeUrl = String(url || "").trim() || "https://web.plaud.ai/file/";
+  const waitDuration = Math.max(0, waitMs);
+
+  if (openUrl) {
+    openWindowsBrowserUrl(browser, safeUrl);
+  }
+  if (waitDuration > 0) {
+    sleepMs(waitDuration);
+  }
+
+  const levelDbDirs = listWindowsProfileLevelDbDirs(config.userDataDir);
+  const deduped = new Map();
+
+  for (const levelDbDir of levelDbDirs) {
+    const candidates = collectWindowsJwtCandidatesFromLevelDb(levelDbDir);
+    for (const item of candidates) {
+      const existing = deduped.get(item.token);
+      if (!existing || item.score > existing.score) {
+        deduped.set(item.token, item);
+      }
+    }
+  }
+
+  const ranked = Array.from(deduped.values()).sort(
+    (a, b) => b.score - a.score || b.token.length - a.token.length
+  );
+  const bestToken = ranked[0]?.token || "";
+
+  return {
+    token: normalizeToken(bestToken),
+    appName: config.appName,
+    url: safeUrl,
+    openUrl,
+    waitMs: waitDuration,
+  };
+}
+
 function resolveBrowserAppName(browser) {
   const key = String(browser || "chrome")
     .trim()
@@ -829,35 +1076,39 @@ function extractTokenViaBrowserAutomation({
   url = "https://web.plaud.ai/file/",
   waitMs = 7000,
 } = {}) {
-  if (process.platform !== "darwin") {
-    throw new Error("Browser auto-auth currently supports macOS only.");
-  }
+  if (process.platform === "darwin") {
+    const appName = resolveBrowserAppName(browser);
+    const safeUrl = String(url || "").trim() || "https://web.plaud.ai/file/";
+    const waitSeconds = Math.max(1, Math.ceil(waitMs / 1000));
+    const jsScript = buildBrowserTokenExtractorJs();
 
-  const appName = resolveBrowserAppName(browser);
-  const safeUrl = String(url || "").trim() || "https://web.plaud.ai/file/";
-  const waitSeconds = Math.max(1, Math.ceil(waitMs / 1000));
-  const jsScript = buildBrowserTokenExtractorJs();
-
-  const lines = [];
-  if (openUrl) {
+    const lines = [];
+    if (openUrl) {
+      lines.push(`tell application ${toAppleScriptString(appName)}`);
+      lines.push("  activate");
+      lines.push("  if (count of windows) = 0 then make new window");
+      lines.push(`  set URL of active tab of front window to ${toAppleScriptString(safeUrl)}`);
+      lines.push("end tell");
+      lines.push(`delay ${waitSeconds}`);
+    }
     lines.push(`tell application ${toAppleScriptString(appName)}`);
-    lines.push("  activate");
-    lines.push("  if (count of windows) = 0 then make new window");
-    lines.push(`  set URL of active tab of front window to ${toAppleScriptString(safeUrl)}`);
+    lines.push(
+      `  set tokenValue to execute active tab of front window javascript ${toAppleScriptString(jsScript)}`
+    );
+    lines.push("  if tokenValue is missing value then return \"\"");
+    lines.push("  return tokenValue");
     lines.push("end tell");
-    lines.push(`delay ${waitSeconds}`);
-  }
-  lines.push(`tell application ${toAppleScriptString(appName)}`);
-  lines.push(
-    `  set tokenValue to execute active tab of front window javascript ${toAppleScriptString(jsScript)}`
-  );
-  lines.push("  if tokenValue is missing value then return \"\"");
-  lines.push("  return tokenValue");
-  lines.push("end tell");
 
-  const stdout = runAppleScript(lines.join("\n"), waitMs + 20000);
-  const token = normalizeToken(stdout === "missing value" ? "" : stdout);
-  return { token, appName, url: safeUrl, openUrl, waitMs };
+    const stdout = runAppleScript(lines.join("\n"), waitMs + 20000);
+    const token = normalizeToken(stdout === "missing value" ? "" : stdout);
+    return { token, appName, url: safeUrl, openUrl, waitMs };
+  }
+
+  if (process.platform === "win32") {
+    return extractTokenViaWindowsStorage({ browser, openUrl, url, waitMs });
+  }
+
+  throw new Error("Browser auto-auth currently supports macOS and Windows only.");
 }
 
 function formatDateFromSessionId(sessionId) {
@@ -1570,17 +1821,9 @@ async function executeToolCall(name, args) {
 
 let negotiatedProtocolVersion = DEFAULT_PROTOCOL_VERSION;
 let stdinBuffer = Buffer.alloc(0);
-let outboundFraming = "content-length";
 
 function sendMessage(payload) {
-  const bodyText = JSON.stringify(payload);
-  if (outboundFraming === "newline-json") {
-    process.stdout.write(bodyText);
-    process.stdout.write("\n");
-    return;
-  }
-
-  const body = Buffer.from(bodyText, "utf8");
+  const body = Buffer.from(JSON.stringify(payload), "utf8");
   const header = Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, "utf8");
   process.stdout.write(header);
   process.stdout.write(body);
@@ -1680,86 +1923,42 @@ function handleNotification(message) {
   if (method === "logging/setLevel") return;
 }
 
-function findHeaderBoundary(buffer) {
-  const crlfIndex = buffer.indexOf("\r\n\r\n");
-  if (crlfIndex !== -1) {
-    return { index: crlfIndex, delimiterLength: 4 };
-  }
-
-  const lfIndex = buffer.indexOf("\n\n");
-  if (lfIndex !== -1) {
-    return { index: lfIndex, delimiterLength: 2 };
-  }
-
-  return { index: -1, delimiterLength: 0 };
-}
-
-function dispatchInboundMessage(message) {
-  if (Object.prototype.hasOwnProperty.call(message, "id")) {
-    void handleRequest(message).catch((err) => {
-      const id = message.id ?? null;
-      logError("Failed to handle MCP request.", err);
-      sendError(id, -32603, "Internal error", err?.message || String(err));
-    });
-    return;
-  }
-
-  handleNotification(message);
-}
-
 function processInputBuffer() {
   while (true) {
-    const headPreview = stdinBuffer.slice(0, Math.min(64, stdinBuffer.length)).toString("utf8");
-    const startsWithContentLength = /^\s*content-length\s*:/i.test(headPreview);
+    const headerEnd = stdinBuffer.indexOf("\r\n\r\n");
+    if (headerEnd === -1) return;
 
-    if (startsWithContentLength) {
-      const { index: headerEnd, delimiterLength } = findHeaderBoundary(stdinBuffer);
-      if (headerEnd === -1) return;
-
-      const headerText = stdinBuffer.slice(0, headerEnd).toString("utf8");
-      const lengthMatch = headerText.match(/content-length:\s*(\d+)/i);
-      if (!lengthMatch) {
-        logError("MCP input is missing Content-Length; skipped one header block.");
-        stdinBuffer = stdinBuffer.slice(headerEnd + delimiterLength);
-        continue;
-      }
-
-      const contentLength = Number(lengthMatch[1]);
-      const messageEnd = headerEnd + delimiterLength + contentLength;
-      if (stdinBuffer.length < messageEnd) return;
-
-      const bodyBuffer = stdinBuffer.slice(headerEnd + delimiterLength, messageEnd);
-      stdinBuffer = stdinBuffer.slice(messageEnd);
-
-      const bodyText = bodyBuffer.toString("utf8");
-      const message = safeJsonParse(bodyText);
-      if (!message || typeof message !== "object") {
-        logError(`MCP input is not valid JSON: ${bodyText.slice(0, 200)}`);
-        continue;
-      }
-
-      outboundFraming = "content-length";
-      dispatchInboundMessage(message);
+    const headerText = stdinBuffer.slice(0, headerEnd).toString("utf8");
+    const lengthMatch = headerText.match(/content-length:\s*(\d+)/i);
+    if (!lengthMatch) {
+      logError("MCP input is missing Content-Length; skipped one header block.");
+      stdinBuffer = stdinBuffer.slice(headerEnd + 4);
       continue;
     }
 
-    const lineEnd = stdinBuffer.indexOf("\n");
-    if (lineEnd === -1) return;
+    const contentLength = Number(lengthMatch[1]);
+    const messageEnd = headerEnd + 4 + contentLength;
+    if (stdinBuffer.length < messageEnd) return;
 
-    const lineText = stdinBuffer.slice(0, lineEnd).toString("utf8");
-    stdinBuffer = stdinBuffer.slice(lineEnd + 1);
+    const bodyBuffer = stdinBuffer.slice(headerEnd + 4, messageEnd);
+    stdinBuffer = stdinBuffer.slice(messageEnd);
 
-    const trimmed = lineText.trim();
-    if (!trimmed) continue;
-
-    const message = safeJsonParse(trimmed);
+    const bodyText = bodyBuffer.toString("utf8");
+    const message = safeJsonParse(bodyText);
     if (!message || typeof message !== "object") {
-      logError(`MCP input line is not valid JSON: ${trimmed.slice(0, 200)}`);
+      logError(`MCP input is not valid JSON: ${bodyText.slice(0, 200)}`);
       continue;
     }
 
-    outboundFraming = "newline-json";
-    dispatchInboundMessage(message);
+    if (Object.prototype.hasOwnProperty.call(message, "id")) {
+      void handleRequest(message).catch((err) => {
+        const id = message.id ?? null;
+        logError("Failed to handle MCP request.", err);
+        sendError(id, -32603, "Internal error", err?.message || String(err));
+      });
+    } else {
+      handleNotification(message);
+    }
   }
 }
 
@@ -1779,3 +1978,4 @@ process.on("uncaughtException", (err) => {
 process.on("unhandledRejection", (reason) => {
   logError("Unhandled promise rejection.", reason);
 });
+
