@@ -4,53 +4,54 @@
 // Source: mcp/plaud-mcp-server.js
 // Build command: npm run mcp:build-standalone
 
-import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 import { gunzipSync } from "node:zlib";
 
 const { normalizeTranscriptionToTransResult } = (() => {
   function normalizeSpeaker(value) {
     if (value == null) return "Speaker 1";
-  
+
     if (typeof value === "number" && Number.isFinite(value)) {
       return `Speaker ${Math.max(1, Math.round(value))}`;
     }
-  
+
     const raw = String(value || "").trim();
     if (!raw) return "Speaker 1";
-  
+
     let m = raw.match(/^Speaker\s*(\d+)$/i) || raw.match(/^speaker\s*(\d+)$/i);
     if (m?.[1]) {
       const n = Number.parseInt(m[1], 10);
       if (Number.isFinite(n)) return `Speaker ${Math.max(1, n)}`;
     }
-  
+
     m = raw.match(/^SPEAKER\s*(\d+)$/i) || raw.match(/^SPEAKER(\d+)$/i);
     if (m?.[1]) {
       const n = Number.parseInt(m[1], 10);
       if (Number.isFinite(n)) return `Speaker ${Math.max(1, n)}`;
     }
-  
+
     m = raw.match(/^SPEAKER[_\s-]*(\d+)$/i) || raw.match(/^speaker[_\s-]*(\d+)$/i);
     if (m?.[1]) {
       const idx0 = Number.parseInt(m[1], 10);
       if (Number.isFinite(idx0)) return `Speaker ${Math.max(1, idx0 + 1)}`;
     }
-  
+
     m = raw.match(/(\d+)/);
     if (m?.[1]) {
       const n = Number.parseInt(m[1], 10);
       if (Number.isFinite(n)) return `Speaker ${Math.max(1, n)}`;
     }
-  
+
     return raw;
   }
 
   const SPEAKER_SEGMENT_MIN_MS = 10_000;
   const SPEAKER_SEGMENT_MAX_MS = 20_000;
   const SPEAKER_SEGMENT_SOFT_MAX_MS = 22_000;
-  
+
   function safeJsonParse(text) {
     try {
       return JSON.parse(text);
@@ -58,7 +59,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
       return null;
     }
   }
-  
+
   function shouldUseRawFallback(value) {
     const raw = String(value || "").trim();
     if (!raw) return false;
@@ -68,37 +69,37 @@ const { normalizeTranscriptionToTransResult } = (() => {
     }
     return true;
   }
-  
+
   function pickNonEmptyString(...values) {
     for (const v of values) {
       if (typeof v === "string" && v.trim()) return v.trim();
     }
     return "";
   }
-  
+
   function toMs(value) {
     const n = Number(value);
     if (!Number.isFinite(n)) return 0;
     if (n <= 0) return 0;
-  
+
     if (n > 24 * 60 * 60 * 1000) return Math.round(n);
     return Math.round(n * 1000);
   }
-  
+
   function normalizeSegmentTimingMs(value, unit) {
     const n = Number(value);
     if (!Number.isFinite(n)) return 0;
     if (unit === "sec") return Math.round(n * 1000);
     return Math.round(n);
   }
-  
+
   function joinSegmentTexts(texts) {
     return String(texts.join(" ") || "")
       .replace(/\s+([,.!?;:])/g, "$1")
       .replace(/\s+/g, " ")
       .trim();
   }
-  
+
   function buildSpeakerSegmentsFromItems(items, options) {
     const list = Array.isArray(items) ? items : [];
     const minMs = options?.minMs ?? SPEAKER_SEGMENT_MIN_MS;
@@ -106,7 +107,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
     const softMaxMs = options?.softMaxMs ?? SPEAKER_SEGMENT_SOFT_MAX_MS;
     const out = [];
     let current = null;
-  
+
     const flush = () => {
       if (!current?.texts?.length) return;
       const content = joinSegmentTexts(current.texts);
@@ -119,7 +120,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
         embeddingKey: null,
       });
     };
-  
+
     for (const item of list) {
       if (!item) continue;
       const text = String(item.text || "").trim();
@@ -127,50 +128,50 @@ const { normalizeTranscriptionToTransResult } = (() => {
       const speaker = normalizeSpeaker(item.speaker);
       const startMs = Number.isFinite(item.startMs) ? item.startMs : 0;
       const endMs = Number.isFinite(item.endMs) ? item.endMs : 0;
-  
+
       if (!current) {
         current = { speaker, startMs, endMs, texts: [text] };
         continue;
       }
-  
+
       if (speaker !== current.speaker) {
         flush();
         current = { speaker, startMs, endMs, texts: [text] };
         continue;
       }
-  
+
       const currentDuration =
         current.endMs > current.startMs ? current.endMs - current.startMs : 0;
       const nextEnd = Math.max(current.endMs, endMs);
       const nextDuration =
         nextEnd > current.startMs ? nextEnd - current.startMs : currentDuration;
-  
+
       if (!current.endMs || !endMs) {
         current.texts.push(text);
         current.endMs = nextEnd || current.endMs;
         continue;
       }
-  
+
       if (nextDuration <= maxMs) {
         current.texts.push(text);
         current.endMs = nextEnd;
         continue;
       }
-  
+
       if (currentDuration < minMs && nextDuration <= softMaxMs) {
         current.texts.push(text);
         current.endMs = nextEnd;
         continue;
       }
-  
+
       flush();
       current = { speaker, startMs, endMs, texts: [text] };
     }
-  
+
     flush();
     return out;
   }
-  
+
   function normalizeZeroBasedSpeakerLabel(value) {
     if (value == null) return "Speaker 1";
     if (typeof value === "number" && Number.isFinite(value)) {
@@ -184,7 +185,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
     }
     return value;
   }
-  
+
   function buildSegmentsFromUtterances(utterances, unit, options = {}) {
     const list = Array.isArray(utterances) ? utterances : [];
     const items = [];
@@ -205,7 +206,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
     }
     return buildSpeakerSegmentsFromItems(items);
   }
-  
+
   function pickWordText(word) {
     return pickNonEmptyString(
       word?.punctuated_word,
@@ -215,7 +216,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
       word?.content
     );
   }
-  
+
   function buildSegmentsFromWords(words, unit, options = {}) {
     const list = Array.isArray(words) ? words : [];
     const items = [];
@@ -236,22 +237,22 @@ const { normalizeTranscriptionToTransResult } = (() => {
     }
     return buildSpeakerSegmentsFromItems(items);
   }
-  
+
   function normalizeTranscriptionToTransResult(data) {
     const root = data ?? {};
-  
+
     const normalizeFromList = (list) => {
       if (!Array.isArray(list)) return null;
-  
+
       const out = [];
       for (const item of list) {
         if (!item || typeof item !== "object") continue;
-  
+
         const content = String(
           item?.content ?? item?.text ?? item?.transcript ?? ""
         ).trim();
         if (!content) continue;
-  
+
         const startMs = Number(item?.start_time ?? item?.startTime ?? 0);
         const endMs = Number(item?.end_time ?? item?.endTime ?? 0);
         out.push({
@@ -269,18 +270,18 @@ const { normalizeTranscriptionToTransResult } = (() => {
           embeddingKey: null,
         });
       }
-  
+
       return out.length ? out : null;
     };
-  
+
     const directRootList = normalizeFromList(Array.isArray(root) ? root : null);
     if (directRootList) return directRootList;
-  
+
     const directDataList = normalizeFromList(
       Array.isArray(root?.data) ? root.data : null
     );
     if (directDataList) return directDataList;
-  
+
     const directTransResult =
       (Array.isArray(root?.trans_result) && root.trans_result) ||
       (Array.isArray(root?.data?.trans_result) && root.data.trans_result) ||
@@ -290,7 +291,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
       for (const item of directTransResult) {
         const content = String(item?.content ?? item?.text ?? "").trim();
         if (!content) continue;
-  
+
         const startMs = Number(item?.start_time ?? item?.startTime ?? 0);
         const endMs = Number(item?.end_time ?? item?.endTime ?? 0);
         out.push({
@@ -310,12 +311,12 @@ const { normalizeTranscriptionToTransResult } = (() => {
       }
       if (out.length) return out;
     }
-  
+
     const segments =
       (Array.isArray(root?.segments) && root.segments) ||
       (Array.isArray(root?.data?.segments) && root.data.segments) ||
       null;
-  
+
     if (segments) {
       const out = [];
       for (const seg of segments) {
@@ -323,7 +324,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
           seg?.text ?? seg?.content ?? seg?.transcript ?? ""
         ).trim();
         if (!content) continue;
-  
+
         out.push({
           content,
           end_time: toMs(seg?.end ?? seg?.end_time ?? seg?.endTime),
@@ -340,7 +341,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
       }
       if (out.length) return out;
     }
-  
+
     const utterances =
       (Array.isArray(root?.utterances) && root.utterances) ||
       (Array.isArray(root?.data?.utterances) && root.data.utterances) ||
@@ -363,7 +364,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
       }
       if (out.length) return out;
     }
-  
+
     const words =
       (Array.isArray(root?.words) && root.words) ||
       (Array.isArray(root?.data?.words) && root.data.words) ||
@@ -395,7 +396,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
         ];
       }
     }
-  
+
     const rawFallback = pickNonEmptyString(root?.raw, root?.data?.raw);
     if (shouldUseRawFallback(rawFallback)) {
       return [
@@ -408,7 +409,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
         },
       ];
     }
-  
+
     const text = pickNonEmptyString(
       root?.text,
       root?.transcript,
@@ -417,9 +418,9 @@ const { normalizeTranscriptionToTransResult } = (() => {
       root?.data?.transcript,
       root?.data?.output_text
     );
-  
+
     if (!text) return [];
-  
+
     return [
       {
         content: text,
@@ -430,13 +431,13 @@ const { normalizeTranscriptionToTransResult } = (() => {
       },
     ];
   }
-  
+
   function normalizeAssemblyAiTranscript(transcript) {
     const utterances = Array.isArray(transcript?.utterances)
       ? transcript.utterances
       : null;
     const words = Array.isArray(transcript?.words) ? transcript.words : null;
-  
+
     if (utterances?.length) {
       const merged = buildSegmentsFromUtterances(utterances, "ms", {
         zeroBasedSpeakers: true,
@@ -453,17 +454,17 @@ const { normalizeTranscriptionToTransResult } = (() => {
         return merged;
       }
     }
-  
+
     if (words?.length) {
       const wordSegments = buildSegmentsFromWords(words, "ms", {
         zeroBasedSpeakers: true,
       });
       if (wordSegments.length) return wordSegments;
     }
-  
+
     return normalizeTranscriptionToTransResult(transcript);
   }
-  
+
   function normalizeDeepgramTranscript(transcript) {
     const utterances = Array.isArray(transcript?.results?.utterances)
       ? transcript.results.utterances
@@ -473,21 +474,21 @@ const { normalizeTranscriptionToTransResult } = (() => {
     )
       ? transcript.results.channels[0].alternatives[0].words
       : null;
-  
+
     if (utterances?.length) {
       const merged = buildSegmentsFromUtterances(utterances, "sec", {
         zeroBasedSpeakers: true,
       });
       if (merged.length) return merged;
     }
-  
+
     if (words?.length) {
       const wordSegments = buildSegmentsFromWords(words, "sec", {
         zeroBasedSpeakers: true,
       });
       if (wordSegments.length) return wordSegments;
     }
-  
+
     return normalizeTranscriptionToTransResult(transcript);
   }
 
@@ -499,9 +500,11 @@ const SERVER_VERSION = "0.1.0";
 const DEFAULT_PROTOCOL_VERSION = "2024-11-05";
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2024-11-05", "2024-10-07"]);
 const DEFAULT_API_ORIGIN = "https://api.plaud.ai";
+const DEFAULT_AUTO_TOKEN_PATH = join(homedir(), ".plaud", "token");
 
 const TOOL_LIST_FILES = "plaud_list_files";
 const TOOL_GET_FILE_DATA = "plaud_get_file_data";
+const TOOL_GET_FILE_AUDIO = "plaud_get_file_audio";
 const TOOL_AUTH_BROWSER = "plaud_auth_browser";
 
 const TOOLS = [
@@ -599,6 +602,47 @@ const TOOLS = [
     },
   },
   {
+    name: TOOL_GET_FILE_AUDIO,
+    description:
+      "Get PLAUD audio temp_url by file_id, and optionally download/save/return the audio bytes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_id: {
+          type: "string",
+          description: "PLAUD file id.",
+        },
+        download: {
+          type: "boolean",
+          default: false,
+          description: "Download audio from temp_url before returning.",
+        },
+        save_to_file: {
+          type: "string",
+          description: "Optional local output file path for downloaded audio.",
+        },
+        return_base64: {
+          type: "boolean",
+          default: false,
+          description: "Return downloaded audio as base64 (size-limited).",
+        },
+        include_data_url: {
+          type: "boolean",
+          default: false,
+          description: "When return_base64=true, also include data URL payload.",
+        },
+        max_bytes: {
+          type: "integer",
+          minimum: 1,
+          description:
+            "Max download bytes. Defaults: 20MB when return_base64=true, otherwise 500MB.",
+        },
+      },
+      required: ["file_id"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: TOOL_AUTH_BROWSER,
     description: "Auto-open PLAUD web app in browser and capture token from page storage.",
     inputSchema: {
@@ -634,7 +678,7 @@ const TOOLS = [
         return_token: {
           type: "boolean",
           default: false,
-          description: "Whether to return full token in response.",
+          description: "Deprecated. Full token is never returned in response.",
         },
       },
       additionalProperties: false,
@@ -720,6 +764,51 @@ function maskToken(token) {
   return `${raw.slice(0, 8)}...${raw.slice(-6)}`;
 }
 
+function isAutoPersistDisabled() {
+  return toBoolean(process.env.PLAUD_DISABLE_AUTO_PERSIST, false);
+}
+
+function readTokenFromFile(filePath) {
+  const pathText = String(filePath || "").trim();
+  if (!pathText) return "";
+  try {
+    const text = readFileSync(pathText, "utf8");
+    return normalizeToken(text);
+  } catch {
+    return "";
+  }
+}
+
+function persistTokenToFile(token, filePath) {
+  const pathText = String(filePath || "").trim();
+  if (!pathText) return { ok: false, path: "", error: "Missing file path" };
+  try {
+    const parent = dirname(pathText);
+    if (parent) {
+      mkdirSync(parent, { recursive: true, mode: 0o700 });
+    }
+    writeFileSync(pathText, `${token}\n`, { encoding: "utf8", mode: 0o600 });
+    return { ok: true, path: pathText, error: "" };
+  } catch (err) {
+    return { ok: false, path: pathText, error: err?.message || String(err) };
+  }
+}
+
+function persistBinaryToFile(buffer, filePath) {
+  const pathText = String(filePath || "").trim();
+  if (!pathText) return { ok: false, path: "", error: "Missing file path" };
+  try {
+    const parent = dirname(pathText);
+    if (parent) {
+      mkdirSync(parent, { recursive: true, mode: 0o700 });
+    }
+    writeFileSync(pathText, buffer, { mode: 0o600 });
+    return { ok: true, path: pathText, error: "" };
+  } catch (err) {
+    return { ok: false, path: pathText, error: err?.message || String(err) };
+  }
+}
+
 function toAppleScriptString(value) {
   return `"${String(value || "")
     .replace(/\\/g, "\\\\")
@@ -747,17 +836,23 @@ function tryParseJwtPayload(token) {
   return safeJsonParse(payloadText);
 }
 
-function scoreWindowsTokenCandidate(token, contextText, filePath) {
+function scoreWindowsTokenCandidate(token, contextText, filePath, source = "generic") {
   const context = String(contextText || "").toLowerCase();
   const file = String(filePath || "").toLowerCase();
   let score = 0;
 
+  const hasSimpleWebPath = context.includes("file/simple/web");
+  const hasAuthorization = context.includes("authorization");
   if (context.includes("plaud")) score += 12;
   if (context.includes("web.plaud.ai")) score += 8;
+  if (hasSimpleWebPath) score += 30;
+  if (hasAuthorization) score += 20;
+  if (hasSimpleWebPath && hasAuthorization) score += 25;
   if (context.includes("token")) score += 4;
   if (context.includes("auth")) score += 3;
   if (context.includes("bearer")) score += 2;
   if (file.includes("\\default\\") || file.includes("/default/")) score += 1;
+  if (source === "request-header-file-simple-web") score += 120;
 
   const payload = tryParseJwtPayload(token);
   if (payload && typeof payload === "object") {
@@ -772,6 +867,39 @@ function scoreWindowsTokenCandidate(token, contextText, filePath) {
   }
 
   return score;
+}
+
+function collectWindowsRequestHeaderCandidates(text, filePath) {
+  const raw = String(text || "");
+  const candidates = [];
+  if (!raw) return candidates;
+
+  const patterns = [
+    /file\/simple\/web[\s\S]{0,3000}?authorization[\s"'=:,\x00-]{0,80}(?:bearer[\s"'=:,\x00-]*)?(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/gi,
+    /authorization[\s"'=:,\x00-]{0,80}(?:bearer[\s"'=:,\x00-]*)?(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})[\s\S]{0,3000}?file\/simple\/web/gi,
+  ];
+
+  for (const regex of patterns) {
+    regex.lastIndex = 0;
+    let match = null;
+    while ((match = regex.exec(raw)) !== null) {
+      const token = normalizeToken(match[1] || "");
+      if (!token) continue;
+      const contextText = match[0];
+      candidates.push({
+        token,
+        source: "request-header-file-simple-web",
+        score: scoreWindowsTokenCandidate(
+          token,
+          contextText,
+          filePath,
+          "request-header-file-simple-web"
+        ),
+      });
+    }
+  }
+
+  return candidates;
 }
 
 function collectWindowsJwtCandidatesFromLevelDb(levelDbDir) {
@@ -793,12 +921,17 @@ function collectWindowsJwtCandidatesFromLevelDb(levelDbDir) {
       const content = readFileSync(filePath);
       if (!content || content.length === 0) continue;
       const maxBytes = 12 * 1024 * 1024;
-      text = content.length > maxBytes
-        ? content.subarray(0, maxBytes).toString("latin1")
-        : content.toString("latin1");
+      const chunks = [];
+      chunks.push(content.subarray(0, Math.min(maxBytes, content.length)));
+      if (content.length > maxBytes) {
+        chunks.push(content.subarray(Math.max(0, content.length - maxBytes), content.length));
+      }
+      text = chunks.map((buf) => buf.toString("latin1")).join("\n");
     } catch {
       continue;
     }
+
+    candidates.push(...collectWindowsRequestHeaderCandidates(text, filePath));
 
     const jwtRegex = /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g;
     let match = null;
@@ -810,7 +943,8 @@ function collectWindowsJwtCandidatesFromLevelDb(levelDbDir) {
       const contextText = text.slice(start, end);
       candidates.push({
         token,
-        score: scoreWindowsTokenCandidate(token, contextText, filePath),
+        source: "generic",
+        score: scoreWindowsTokenCandidate(token, contextText, filePath, "generic"),
       });
     }
   }
@@ -961,10 +1095,28 @@ function extractTokenViaWindowsStorage({
   const ranked = Array.from(deduped.values()).sort(
     (a, b) => b.score - a.score || b.token.length - a.token.length
   );
-  const bestToken = ranked[0]?.token || "";
+  const requestHeaderRanked = ranked.filter(
+    (item) => item?.source === "request-header-file-simple-web"
+  );
+  const orderedRanked = requestHeaderRanked.length
+    ? requestHeaderRanked.concat(
+      ranked.filter((item) => item?.source !== "request-header-file-simple-web")
+    )
+    : ranked;
+
+  const tokenCandidates = orderedRanked
+    .map((item) => normalizeToken(item.token))
+    .filter(Boolean)
+    .slice(0, 30);
+  const bestToken = tokenCandidates[0] || "";
+  const bestSource = orderedRanked[0]?.source || "";
 
   return {
     token: normalizeToken(bestToken),
+    tokenCandidates,
+    candidateCount: tokenCandidates.length,
+    candidateSource: bestSource,
+    requestHeaderCandidateCount: requestHeaderRanked.length,
     appName: config.appName,
     url: safeUrl,
     openUrl,
@@ -1292,6 +1444,46 @@ async function fetchJsonFromUrlMaybeGzip(url) {
   };
 }
 
+async function fetchBinaryFromUrl(url, options = {}) {
+  const requestUrl = String(url || "").trim();
+  if (!requestUrl) throw new Error("Missing downloadable URL");
+
+  const maxBytes = clampInteger(options?.maxBytes, {
+    defaultValue: 500 * 1024 * 1024,
+    min: 1,
+    max: 1_000_000_000,
+  });
+
+  const response = await fetch(requestUrl, { method: "GET" });
+  const contentType = String(response.headers.get("content-type") || "").trim();
+  const contentLengthHeader = String(response.headers.get("content-length") || "").trim();
+  const contentLength = Number(contentLengthHeader);
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Audio download failed (HTTP ${response.status}): ${text.slice(0, 200)}`);
+  }
+
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw new Error(`Audio exceeds max_bytes (${contentLength} > ${maxBytes}).`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (buffer.length > maxBytes) {
+    throw new Error(`Audio exceeds max_bytes (${buffer.length} > ${maxBytes}).`);
+  }
+
+  return {
+    buffer,
+    size: buffer.length,
+    contentType,
+    contentLength: Number.isFinite(contentLength) && contentLength > 0
+      ? Math.floor(contentLength)
+      : 0,
+    requestUrl: response.url || requestUrl,
+  };
+}
+
 function formatSpeakerForTranscript(value) {
   const raw = String(value || "").trim();
   const match = raw.match(/^SPEAKER\s*(\d+)$/i) || raw.match(/^SPEAKER(\d+)$/i);
@@ -1395,6 +1587,83 @@ class PlaudClient {
     const resp = await this.requestJson({ method: "GET", pathname: `/file/detail/${encoded}` });
     return { detail: resp.data, requestUrl: resp.requestUrl };
   }
+
+  async getFileTempUrl(fileId) {
+    const encoded = encodeURIComponent(String(fileId || "").trim());
+    const resp = await this.requestJson({ method: "GET", pathname: `/file/temp-url/${encoded}` });
+    const tempUrl = pickNonEmptyString(resp?.data?.temp_url, resp?.data?.data?.temp_url);
+    if (!tempUrl) {
+      throw new Error("temp_url field not found in PLAUD response");
+    }
+    return { tempUrl, requestUrl: resp.requestUrl, raw: resp.data };
+  }
+}
+
+async function verifyPlaudTokenCandidate(token, apiOrigin) {
+  const normalized = normalizeToken(token);
+  if (!normalized) {
+    return { ok: false, token: "", requestUrl: "", apiOrigin: "", error: "empty token" };
+  }
+
+  const candidateClient = new PlaudClient({ token: normalized, apiOrigin });
+  try {
+    const response = await candidateClient.listFiles({ skip: 0, limit: 1, isTrash: 2 });
+    return {
+      ok: true,
+      token: normalized,
+      requestUrl: response.requestUrl || "",
+      apiOrigin: candidateClient.apiOrigin,
+      error: "",
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      token: normalized,
+      requestUrl: "",
+      apiOrigin: candidateClient.apiOrigin,
+      error: err?.message || String(err),
+    };
+  }
+}
+
+async function pickFirstValidPlaudToken(candidates, options = {}) {
+  const configuredOrigin = normalizeApiOrigin(options?.apiOrigin) || DEFAULT_API_ORIGIN;
+  const list = Array.isArray(candidates) ? candidates : [candidates];
+  const unique = Array.from(new Set(list.map((item) => normalizeToken(item)).filter(Boolean)));
+  const maxChecks = clampInteger(options?.maxChecks, {
+    defaultValue: 8,
+    min: 1,
+    max: 30,
+  });
+  const checked = [];
+
+  for (let index = 0; index < unique.length && index < maxChecks; index += 1) {
+    const candidate = unique[index];
+    const probe = await verifyPlaudTokenCandidate(candidate, configuredOrigin);
+    checked.push({
+      index,
+      ok: probe.ok,
+      error: probe.error,
+      token_masked: maskToken(candidate),
+    });
+    if (probe.ok) {
+      return {
+        ok: true,
+        token: probe.token,
+        apiOrigin: probe.apiOrigin,
+        requestUrl: probe.requestUrl,
+        checked,
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    token: "",
+    apiOrigin: configuredOrigin,
+    requestUrl: "",
+    checked,
+  };
 }
 
 function normalizeFileListEntry(item, includeRaw) {
@@ -1587,13 +1856,11 @@ function resolvePlaudToken() {
   if (directToken) return directToken;
 
   const tokenFile = String(process.env.PLAUD_TOKEN_FILE || "").trim();
-  if (!tokenFile) return "";
-  try {
-    const text = readFileSync(tokenFile, "utf8");
-    return normalizeToken(text);
-  } catch {
-    return "";
-  }
+  const explicitFileToken = readTokenFromFile(tokenFile);
+  if (explicitFileToken) return explicitFileToken;
+
+  if (isAutoPersistDisabled()) return "";
+  return readTokenFromFile(DEFAULT_AUTO_TOKEN_PATH);
 }
 
 function resolvePlaudTokenSource() {
@@ -1606,6 +1873,9 @@ function resolvePlaudTokenSource() {
     return "env";
   }
   if (String(process.env.PLAUD_TOKEN_FILE || "").trim()) return "token_file";
+  if (!isAutoPersistDisabled() && readTokenFromFile(DEFAULT_AUTO_TOKEN_PATH)) {
+    return "persisted_file";
+  }
   return "";
 }
 
@@ -1640,6 +1910,11 @@ async function handleAuthBrowser(args) {
   const waitMs = clampInteger(args?.wait_ms, { defaultValue: 7000, min: 1000, max: 30000 });
   const saveToFile = String(args?.save_to_file || "").trim();
   const returnToken = toBoolean(args?.return_token, false);
+  const autoPersistDisabled = isAutoPersistDisabled();
+  const autoPersistEnabled = !autoPersistDisabled;
+  const persistTargetPath = autoPersistDisabled
+    ? ""
+    : (saveToFile || DEFAULT_AUTO_TOKEN_PATH);
 
   const result = extractTokenViaBrowserAutomation({
     browser,
@@ -1648,17 +1923,51 @@ async function handleAuthBrowser(args) {
     waitMs,
   });
 
-  const token = normalizeToken(result?.token);
-  if (!token) {
+  const tokenCandidates = Array.isArray(result?.tokenCandidates)
+    ? result.tokenCandidates
+    : [result?.token];
+  const normalizedCandidates = tokenCandidates.map((item) => normalizeToken(item)).filter(Boolean);
+  if (!normalizedCandidates.length) {
     throw new Error(
       "No PLAUD token captured. Please ensure browser is logged in, keep web.plaud.ai open, and retry."
     );
   }
 
-  setRuntimePlaudToken(token, `browser:${result.appName}`);
+  const validation = await pickFirstValidPlaudToken(normalizedCandidates, {
+    apiOrigin: process.env.PLAUD_API_ORIGIN,
+    maxChecks: 8,
+  });
+  if (!validation.ok || !validation.token) {
+    const firstError = validation.checked.find((item) => !item.ok)?.error || "unknown error";
+    throw new Error(
+      `Captured token(s) from browser but all failed PLAUD API validation. First error: ${firstError}`
+    );
+  }
 
-  if (saveToFile) {
-    writeFileSync(saveToFile, `${token}\n`, { encoding: "utf8", mode: 0o600 });
+  const token = validation.token;
+  setRuntimePlaudToken(token, `browser:${result.appName}`);
+  plaudClient = new PlaudClient({
+    token,
+    apiOrigin: validation.apiOrigin || normalizeApiOrigin(process.env.PLAUD_API_ORIGIN) || DEFAULT_API_ORIGIN,
+  });
+
+  let savedPath = "";
+  let persistMode = "none";
+  let persistError = "";
+  if (autoPersistDisabled && saveToFile) {
+    persistError = "PLAUD_DISABLE_AUTO_PERSIST=1 is set; save_to_file is ignored.";
+  }
+  if (persistTargetPath) {
+    const persisted = persistTokenToFile(token, persistTargetPath);
+    if (!persisted.ok) {
+      if (saveToFile) {
+        throw new Error(`Failed to persist token to save_to_file: ${persisted.error}`);
+      }
+      persistError = persisted.error;
+    } else {
+      savedPath = persisted.path;
+      persistMode = saveToFile ? "explicit" : "auto_default";
+    }
   }
 
   return {
@@ -1670,9 +1979,18 @@ async function handleAuthBrowser(args) {
     browser_app: result.appName,
     opened_url: result.openUrl ? result.url : "",
     wait_ms: waitMs,
-    saved_to_file: saveToFile || "",
-    return_token: returnToken,
-    token: returnToken ? token : "",
+    token_candidate_source: String(result.candidateSource || ""),
+    request_header_candidates: Number(result.requestHeaderCandidateCount || 0),
+    validated: true,
+    validated_request_url: validation.requestUrl || "",
+    token_candidates_checked: validation.checked.length,
+    auto_persist_enabled: autoPersistEnabled,
+    persist_mode: persistMode,
+    persist_error: persistError,
+    saved_to_file: savedPath,
+    return_token_requested: returnToken,
+    return_token: false,
+    token: "",
   };
 }
 
@@ -1797,6 +2115,67 @@ async function handleGetFileData(args) {
   return result;
 }
 
+async function handleGetFileAudio(args) {
+  const client = getPlaudClient();
+  const fileId = pickNonEmptyString(args?.file_id, args?.fileId);
+  if (!fileId) throw new Error("Missing file_id");
+
+  const saveToFile = String(args?.save_to_file || "").trim();
+  const returnBase64 = toBoolean(args?.return_base64, false);
+  const includeDataUrl = returnBase64 && toBoolean(args?.include_data_url, false);
+  const explicitDownload = toBoolean(args?.download, false);
+  const shouldDownload = explicitDownload || Boolean(saveToFile) || returnBase64;
+  const defaultMaxBytes = returnBase64 ? 20 * 1024 * 1024 : 500 * 1024 * 1024;
+  const maxBytes = clampInteger(args?.max_bytes, {
+    defaultValue: defaultMaxBytes,
+    min: 1,
+    max: 1_000_000_000,
+  });
+
+  const tempUrlResp = await client.getFileTempUrl(fileId);
+  const result = {
+    api_origin: client.apiOrigin,
+    file_id: fileId,
+    request_url: tempUrlResp.requestUrl,
+    temp_url: tempUrlResp.tempUrl,
+    download_performed: shouldDownload,
+  };
+
+  if (!shouldDownload) {
+    return result;
+  }
+
+  const downloaded = await fetchBinaryFromUrl(tempUrlResp.tempUrl, { maxBytes });
+  const audio = {
+    final_url: downloaded.requestUrl,
+    content_type: downloaded.contentType,
+    size: downloaded.size,
+    max_bytes: maxBytes,
+    saved_to_file: "",
+    returned_base64: returnBase64,
+  };
+
+  if (saveToFile) {
+    const persisted = persistBinaryToFile(downloaded.buffer, saveToFile);
+    if (!persisted.ok) {
+      throw new Error(`Failed to save audio file: ${persisted.error}`);
+    }
+    audio.saved_to_file = persisted.path;
+  }
+
+  if (returnBase64) {
+    const base64 = downloaded.buffer.toString("base64");
+    audio.base64 = base64;
+    if (includeDataUrl) {
+      const mimeType = downloaded.contentType || "application/octet-stream";
+      audio.data_url = `data:${mimeType};base64,${base64}`;
+    }
+  }
+
+  result.audio = audio;
+  return result;
+}
+
 function buildToolTextResult(payload) {
   return {
     content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
@@ -1816,14 +2195,23 @@ async function executeToolCall(name, args) {
   if (name === TOOL_AUTH_BROWSER) return handleAuthBrowser(args || {});
   if (name === TOOL_LIST_FILES) return handleListFiles(args || {});
   if (name === TOOL_GET_FILE_DATA) return handleGetFileData(args || {});
+  if (name === TOOL_GET_FILE_AUDIO) return handleGetFileAudio(args || {});
   throw new Error(`Unknown tool: ${name}`);
 }
 
 let negotiatedProtocolVersion = DEFAULT_PROTOCOL_VERSION;
 let stdinBuffer = Buffer.alloc(0);
+let outboundFraming = "content-length";
 
 function sendMessage(payload) {
-  const body = Buffer.from(JSON.stringify(payload), "utf8");
+  const bodyText = JSON.stringify(payload);
+  if (outboundFraming === "newline-json") {
+    process.stdout.write(bodyText);
+    process.stdout.write("\n");
+    return;
+  }
+
+  const body = Buffer.from(bodyText, "utf8");
   const header = Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, "utf8");
   process.stdout.write(header);
   process.stdout.write(body);
@@ -1874,7 +2262,7 @@ async function handleRequest(message) {
       },
       instructions: token
         ? `PLAUD token loaded (${maskToken(token)}), source=${tokenSource || "unknown"}.`
-        : "No PLAUD token found. Set PLAUD_TOKEN / PLAUD_TOKEN_FILE, or call tool plaud_auth_browser.",
+        : "No PLAUD token found. Set PLAUD_TOKEN / PLAUD_TOKEN_FILE, or call tool plaud_auth_browser (auto-saves to ~/.plaud/token unless PLAUD_DISABLE_AUTO_PERSIST=1).",
     });
     return;
   }
@@ -1923,42 +2311,86 @@ function handleNotification(message) {
   if (method === "logging/setLevel") return;
 }
 
+function findHeaderBoundary(buffer) {
+  const crlfIndex = buffer.indexOf("\r\n\r\n");
+  if (crlfIndex !== -1) {
+    return { index: crlfIndex, delimiterLength: 4 };
+  }
+
+  const lfIndex = buffer.indexOf("\n\n");
+  if (lfIndex !== -1) {
+    return { index: lfIndex, delimiterLength: 2 };
+  }
+
+  return { index: -1, delimiterLength: 0 };
+}
+
+function dispatchInboundMessage(message) {
+  if (Object.prototype.hasOwnProperty.call(message, "id")) {
+    void handleRequest(message).catch((err) => {
+      const id = message.id ?? null;
+      logError("Failed to handle MCP request.", err);
+      sendError(id, -32603, "Internal error", err?.message || String(err));
+    });
+    return;
+  }
+
+  handleNotification(message);
+}
+
 function processInputBuffer() {
   while (true) {
-    const headerEnd = stdinBuffer.indexOf("\r\n\r\n");
-    if (headerEnd === -1) return;
+    const headPreview = stdinBuffer.slice(0, Math.min(64, stdinBuffer.length)).toString("utf8");
+    const startsWithContentLength = /^\s*content-length\s*:/i.test(headPreview);
 
-    const headerText = stdinBuffer.slice(0, headerEnd).toString("utf8");
-    const lengthMatch = headerText.match(/content-length:\s*(\d+)/i);
-    if (!lengthMatch) {
-      logError("MCP input is missing Content-Length; skipped one header block.");
-      stdinBuffer = stdinBuffer.slice(headerEnd + 4);
+    if (startsWithContentLength) {
+      const { index: headerEnd, delimiterLength } = findHeaderBoundary(stdinBuffer);
+      if (headerEnd === -1) return;
+
+      const headerText = stdinBuffer.slice(0, headerEnd).toString("utf8");
+      const lengthMatch = headerText.match(/content-length:\s*(\d+)/i);
+      if (!lengthMatch) {
+        logError("MCP input is missing Content-Length; skipped one header block.");
+        stdinBuffer = stdinBuffer.slice(headerEnd + delimiterLength);
+        continue;
+      }
+
+      const contentLength = Number(lengthMatch[1]);
+      const messageEnd = headerEnd + delimiterLength + contentLength;
+      if (stdinBuffer.length < messageEnd) return;
+
+      const bodyBuffer = stdinBuffer.slice(headerEnd + delimiterLength, messageEnd);
+      stdinBuffer = stdinBuffer.slice(messageEnd);
+
+      const bodyText = bodyBuffer.toString("utf8");
+      const message = safeJsonParse(bodyText);
+      if (!message || typeof message !== "object") {
+        logError(`MCP input is not valid JSON: ${bodyText.slice(0, 200)}`);
+        continue;
+      }
+
+      outboundFraming = "content-length";
+      dispatchInboundMessage(message);
       continue;
     }
 
-    const contentLength = Number(lengthMatch[1]);
-    const messageEnd = headerEnd + 4 + contentLength;
-    if (stdinBuffer.length < messageEnd) return;
+    const lineEnd = stdinBuffer.indexOf("\n");
+    if (lineEnd === -1) return;
 
-    const bodyBuffer = stdinBuffer.slice(headerEnd + 4, messageEnd);
-    stdinBuffer = stdinBuffer.slice(messageEnd);
+    const lineText = stdinBuffer.slice(0, lineEnd).toString("utf8");
+    stdinBuffer = stdinBuffer.slice(lineEnd + 1);
 
-    const bodyText = bodyBuffer.toString("utf8");
-    const message = safeJsonParse(bodyText);
+    const trimmed = lineText.trim();
+    if (!trimmed) continue;
+
+    const message = safeJsonParse(trimmed);
     if (!message || typeof message !== "object") {
-      logError(`MCP input is not valid JSON: ${bodyText.slice(0, 200)}`);
+      logError(`MCP input line is not valid JSON: ${trimmed.slice(0, 200)}`);
       continue;
     }
 
-    if (Object.prototype.hasOwnProperty.call(message, "id")) {
-      void handleRequest(message).catch((err) => {
-        const id = message.id ?? null;
-        logError("Failed to handle MCP request.", err);
-        sendError(id, -32603, "Internal error", err?.message || String(err));
-      });
-    } else {
-      handleNotification(message);
-    }
+    outboundFraming = "newline-json";
+    dispatchInboundMessage(message);
   }
 }
 
