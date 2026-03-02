@@ -52,7 +52,10 @@ Then in your Claude conversation, use these prompts:
 Call MCP tool plaud_auth_browser with arguments {"browser":"chrome","open_url":true,"url":"https://web.plaud.ai/file/","wait_ms":10000} and return the raw result.
 ```
 
+`url` can also be set to `https://app.plaud.ai/file/`.
+
 After successful validation, token is auto-saved to `~/.plaud/token` by default.
+The API origin state paired with the token is also saved to `~/.plaud/token.api-origins.json`.
 To disable this behavior, set env `PLAUD_DISABLE_AUTO_PERSIST=1` when registering the MCP server (`save_to_file` will also be ignored).
 
 2. List files
@@ -90,11 +93,19 @@ claude mcp remove plaud-local
 claude mcp add --scope user -e PLAUD_TOKEN=YOUR_TOKEN plaud-local -- node /absolute/path/plaud-mcp-server.standalone.js
 ```
 
+If your region uses a non-default API domain, you can also add:
+
+```bash
+claude mcp add --scope user -e PLAUD_TOKEN=YOUR_TOKEN -e PLAUD_API_ORIGINS=https://api.plaud.ai,https://api-eu.plaud.ai plaud-local -- node /absolute/path/plaud-mcp-server.standalone.js
+```
+
 If you want browser auth but custom save path, call:
 
 ```text
 Call MCP tool plaud_auth_browser with arguments {"browser":"chrome","save_to_file":"/absolute/path/plaud.token"}.
 ```
+
+This also writes `/absolute/path/plaud.token.api-origins.json`, so MCP can reuse the regional API origin after restart.
 
 ## Troubleshooting
 
@@ -103,7 +114,7 @@ Call MCP tool plaud_auth_browser with arguments {"browser":"chrome","save_to_fil
 - Restart your Claude session
 
 2. `plaud_auth_browser` cannot capture token
-- Make sure you are logged in at `https://web.plaud.ai/file/`
+- Make sure you are logged in at `https://web.plaud.ai/file/` or `https://app.plaud.ai/file/`
 - Increase `wait_ms` to `15000`
 - On macOS, allow Terminal/iTerm to control your browser when prompted
 - On Windows, if capture still fails, fully close the target browser once and retry

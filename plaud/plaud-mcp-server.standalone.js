@@ -6,6 +6,7 @@
 
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { gunzipSync } from "node:zlib";
@@ -500,7 +501,10 @@ const SERVER_VERSION = "0.1.0";
 const DEFAULT_PROTOCOL_VERSION = "2024-11-05";
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2024-11-05", "2024-10-07"]);
 const DEFAULT_API_ORIGIN = "https://api.plaud.ai";
+const DEFAULT_WEB_FILE_URL = "https://web.plaud.ai/file/";
+const DEFAULT_APP_FILE_URL = "https://app.plaud.ai/file/";
 const DEFAULT_AUTO_TOKEN_PATH = join(homedir(), ".plaud", "token");
+const API_ORIGIN_STATE_FILE_SUFFIX = ".api-origins.json";
 
 const TOOL_LIST_FILES = "plaud_list_files";
 const TOOL_GET_FILE_DATA = "plaud_get_file_data";
@@ -661,8 +665,8 @@ const TOOLS = [
         },
         url: {
           type: "string",
-          default: "https://web.plaud.ai/file/",
-          description: "Target PLAUD page URL.",
+          default: DEFAULT_WEB_FILE_URL,
+          description: "Target PLAUD page URL (web/app domains are both supported).",
         },
         wait_ms: {
           type: "integer",
@@ -714,8 +718,177 @@ function normalizeApiOrigin(rawOrigin) {
     const url = new URL(value);
     return url.origin;
   } catch {
-    return value.replace(/\/+$/, "");
+    const sanitized = value.replace(/\/+$/, "");
+    if (!sanitized) return "";
+    if (sanitized.startsWith("//")) {
+      try {
+        return new URL(`https:${sanitized}`).origin;
+      } catch {
+        return `https:${sanitized.replace(/^\/+/, "")}`;
+      }
+    }
+    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(sanitized)) {
+      try {
+        return new URL(`https://${sanitized}`).origin;
+      } catch {
+        return `https://${sanitized.replace(/^\/+/, "")}`;
+      }
+    }
+    return sanitized;
   }
+}
+
+function toTokenFingerprint(token) {
+  const normalized = normalizeToken(token);
+  if (!normalized) return "";
+  return createHash("sha256").update(normalized).digest("hex");
+}
+
+function resolveApiOriginStateFilePath(tokenFilePath) {
+  const pathText = String(tokenFilePath || "").trim();
+  if (!pathText) return "";
+  return `${pathText}${API_ORIGIN_STATE_FILE_SUFFIX}`;
+}
+
+function dedupeApiOrigins(values) {
+  const list = Array.isArray(values) ? values : [values];
+  const output = [];
+  const seen = new Set();
+  for (const value of list) {
+    const origin = normalizeApiOrigin(value);
+    if (!origin) continue;
+    const key = origin.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(origin);
+  }
+  return output;
+}
+
+function normalizeApiOriginList(rawValue) {
+  if (Array.isArray(rawValue)) {
+    return dedupeApiOrigins(rawValue);
+  }
+  const text = String(rawValue || "").trim();
+  if (!text) return [];
+
+  const parsedJson = safeJsonParse(text);
+  if (Array.isArray(parsedJson)) {
+    return dedupeApiOrigins(parsedJson);
+  }
+
+  const parts = text
+    .split(/[\s,;]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return dedupeApiOrigins(parts);
+}
+
+function swapPlaudWebAppHost(hostname) {
+  const host = String(hostname || "").trim().toLowerCase();
+  if (!host) return "";
+  if (host.startsWith("web.")) return `app.${host.slice(4)}`;
+  if (host.startsWith("app.")) return `web.${host.slice(4)}`;
+  if (host.startsWith("web-")) return `app-${host.slice(4)}`;
+  if (host.startsWith("app-")) return `web-${host.slice(4)}`;
+  return "";
+}
+
+function inferApiOriginsFromPlaudPageUrl(pageUrl) {
+  const rawUrl = String(pageUrl || "").trim();
+  if (!rawUrl) return [];
+
+  let parsed = null;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return [];
+  }
+
+  const protocol = parsed.protocol === "http:" ? "http" : "https";
+  const host = String(parsed.hostname || "").trim().toLowerCase();
+  if (!host) return [];
+
+  const candidates = [];
+  const pushHost = (nextHost) => {
+    if (!nextHost) return;
+    candidates.push(`${protocol}://${nextHost}`);
+  };
+
+  if (host.startsWith("api.")) {
+    pushHost(host);
+  }
+
+  if (host.startsWith("api-")) {
+    pushHost(host);
+  }
+
+  if (host.startsWith("web.")) {
+    pushHost(`api.${host.slice(4)}`);
+  }
+
+  if (host.startsWith("app.")) {
+    pushHost(`api.${host.slice(4)}`);
+  }
+
+  if (host.startsWith("web-")) {
+    pushHost(`api-${host.slice(4)}`);
+  }
+
+  if (host.startsWith("app-")) {
+    pushHost(`api-${host.slice(4)}`);
+  }
+
+  return dedupeApiOrigins(candidates);
+}
+
+function buildPlaudPageUrlCandidates(rawUrl) {
+  const fallback = DEFAULT_WEB_FILE_URL;
+  const primary = String(rawUrl || "").trim() || fallback;
+  const candidates = [primary, DEFAULT_WEB_FILE_URL, DEFAULT_APP_FILE_URL];
+
+  try {
+    const parsed = new URL(primary);
+    const swappedHost = swapPlaudWebAppHost(parsed.hostname);
+    if (swappedHost) {
+      const swapped = new URL(parsed.toString());
+      swapped.hostname = swappedHost;
+      candidates.push(swapped.toString());
+    }
+  } catch {
+    // ignore invalid URL and keep existing candidates
+  }
+
+  return Array.from(new Set(candidates.map((item) => String(item || "").trim()).filter(Boolean)));
+}
+
+function resolvePlaudApiOriginCandidates(options = {}) {
+  const configured = normalizeApiOrigin(options?.apiOrigin);
+  const extraFromOptions = normalizeApiOriginList(options?.apiOrigins);
+  const extraFromEnv = normalizeApiOriginList(process.env.PLAUD_API_ORIGINS);
+  const inferredFromPageUrl = inferApiOriginsFromPlaudPageUrl(options?.pageUrl);
+  const current = normalizeApiOrigin(options?.currentOrigin);
+
+  return dedupeApiOrigins([
+    current,
+    configured,
+    ...extraFromOptions,
+    ...extraFromEnv,
+    ...inferredFromPageUrl,
+    DEFAULT_API_ORIGIN,
+  ]);
+}
+
+function extractRedirectApiOrigin(payload) {
+  return normalizeApiOrigin(
+    payload?.data?.domains?.api ||
+      payload?.domains?.api ||
+      payload?.data?.domain?.api ||
+      payload?.data?.api_origin ||
+      payload?.data?.apiOrigin ||
+      payload?.api_origin ||
+      payload?.apiOrigin
+  );
 }
 
 function normalizePlaudBool(value) {
@@ -779,6 +952,84 @@ function readTokenFromFile(filePath) {
   }
 }
 
+function readApiOriginStateFromFile(filePath, token = "") {
+  const pathText = String(filePath || "").trim();
+  if (!pathText) {
+    return {
+      apiOrigin: "",
+      apiOrigins: [],
+      path: "",
+      matchedToken: false,
+      hasFile: false,
+    };
+  }
+
+  let text = "";
+  try {
+    text = readFileSync(pathText, "utf8");
+  } catch {
+    return {
+      apiOrigin: "",
+      apiOrigins: [],
+      path: pathText,
+      matchedToken: false,
+      hasFile: false,
+    };
+  }
+
+  const rawText = String(text || "").trim();
+  if (!rawText) {
+    return {
+      apiOrigin: "",
+      apiOrigins: [],
+      path: pathText,
+      matchedToken: false,
+      hasFile: true,
+    };
+  }
+
+  const parsed = safeJsonParse(rawText);
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const tokenFingerprint = String(
+      parsed?.token_fingerprint || parsed?.tokenFingerprint || ""
+    ).trim();
+    const expectedFingerprint = toTokenFingerprint(token);
+    const matchedToken = !tokenFingerprint || !expectedFingerprint || tokenFingerprint === expectedFingerprint;
+    if (!matchedToken) {
+      return {
+        apiOrigin: "",
+        apiOrigins: [],
+        path: pathText,
+        matchedToken: false,
+        hasFile: true,
+      };
+    }
+
+    const apiOrigins = dedupeApiOrigins([
+      parsed?.api_origin,
+      parsed?.apiOrigin,
+      ...(Array.isArray(parsed?.api_origins) ? parsed.api_origins : []),
+      ...normalizeApiOriginList(parsed?.apiOrigins),
+    ]);
+    return {
+      apiOrigin: apiOrigins[0] || "",
+      apiOrigins,
+      path: pathText,
+      matchedToken: Boolean(tokenFingerprint),
+      hasFile: true,
+    };
+  }
+
+  const apiOrigins = normalizeApiOriginList(rawText);
+  return {
+    apiOrigin: apiOrigins[0] || "",
+    apiOrigins,
+    path: pathText,
+    matchedToken: false,
+    hasFile: true,
+  };
+}
+
 function persistTokenToFile(token, filePath) {
   const pathText = String(filePath || "").trim();
   if (!pathText) return { ok: false, path: "", error: "Missing file path" };
@@ -788,6 +1039,39 @@ function persistTokenToFile(token, filePath) {
       mkdirSync(parent, { recursive: true, mode: 0o700 });
     }
     writeFileSync(pathText, `${token}\n`, { encoding: "utf8", mode: 0o600 });
+    return { ok: true, path: pathText, error: "" };
+  } catch (err) {
+    return { ok: false, path: pathText, error: err?.message || String(err) };
+  }
+}
+
+function persistApiOriginStateToFile({ token, apiOrigin, apiOrigins, filePath }) {
+  const pathText = String(filePath || "").trim();
+  if (!pathText) return { ok: false, path: "", error: "Missing file path" };
+
+  const origins = dedupeApiOrigins([apiOrigin, ...normalizeApiOriginList(apiOrigins)]);
+  if (!origins.length) {
+    return { ok: false, path: pathText, error: "No API origins to persist" };
+  }
+
+  const tokenFingerprint = toTokenFingerprint(token);
+  const payload = {
+    version: 1,
+    token_fingerprint: tokenFingerprint,
+    api_origin: origins[0],
+    api_origins: origins,
+    updated_at: new Date().toISOString(),
+  };
+
+  try {
+    const parent = dirname(pathText);
+    if (parent) {
+      mkdirSync(parent, { recursive: true, mode: 0o700 });
+    }
+    writeFileSync(pathText, `${JSON.stringify(payload, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
     return { ok: true, path: pathText, error: "" };
   } catch (err) {
     return { ok: false, path: pathText, error: err?.message || String(err) };
@@ -845,6 +1129,9 @@ function scoreWindowsTokenCandidate(token, contextText, filePath, source = "gene
   const hasAuthorization = context.includes("authorization");
   if (context.includes("plaud")) score += 12;
   if (context.includes("web.plaud.ai")) score += 8;
+  if (context.includes("app.plaud.ai")) score += 8;
+  if (context.includes("api.plaud.ai")) score += 7;
+  if (context.includes(".plaud.")) score += 4;
   if (hasSimpleWebPath) score += 30;
   if (hasAuthorization) score += 20;
   if (hasSimpleWebPath && hasAuthorization) score += 25;
@@ -869,6 +1156,33 @@ function scoreWindowsTokenCandidate(token, contextText, filePath, source = "gene
   return score;
 }
 
+function extractPlaudApiOriginFromText(text) {
+  const raw = String(text || "");
+  if (!raw) return "";
+
+  const directUrlMatch = raw.match(/https?:\/\/[A-Za-z0-9.-]+\/file\/simple\/web\b/i);
+  if (directUrlMatch?.[0]) {
+    try {
+      const parsed = new URL(directUrlMatch[0]);
+      return normalizeApiOrigin(parsed.origin);
+    } catch {
+      // ignore
+    }
+  }
+
+  const hostMatch = raw.match(
+    /\bhost[\s"'=:,\x00-]{0,24}([A-Za-z0-9.-]*plaud\.[A-Za-z0-9.-]+)/i
+  );
+  if (hostMatch?.[1]) {
+    const host = String(hostMatch[1]).trim().replace(/[^A-Za-z0-9.-].*$/, "");
+    if (host) {
+      return normalizeApiOrigin(`https://${host}`);
+    }
+  }
+
+  return "";
+}
+
 function collectWindowsRequestHeaderCandidates(text, filePath) {
   const raw = String(text || "");
   const candidates = [];
@@ -886,8 +1200,10 @@ function collectWindowsRequestHeaderCandidates(text, filePath) {
       const token = normalizeToken(match[1] || "");
       if (!token) continue;
       const contextText = match[0];
+      const apiOrigin = extractPlaudApiOriginFromText(contextText);
       candidates.push({
         token,
+        apiOrigin,
         source: "request-header-file-simple-web",
         score: scoreWindowsTokenCandidate(
           token,
@@ -941,8 +1257,10 @@ function collectWindowsJwtCandidatesFromLevelDb(levelDbDir) {
       const start = Math.max(0, match.index - 160);
       const end = Math.min(text.length, match.index + token.length + 160);
       const contextText = text.slice(start, end);
+      const apiOrigin = extractPlaudApiOriginFromText(contextText);
       candidates.push({
         token,
+        apiOrigin,
         source: "generic",
         score: scoreWindowsTokenCandidate(token, contextText, filePath, "generic"),
       });
@@ -1065,11 +1383,11 @@ function sleepMs(timeoutMs) {
 function extractTokenViaWindowsStorage({
   browser = "chrome",
   openUrl = true,
-  url = "https://web.plaud.ai/file/",
+  url = DEFAULT_WEB_FILE_URL,
   waitMs = 7000,
 } = {}) {
   const config = resolveWindowsBrowserConfig(browser);
-  const safeUrl = String(url || "").trim() || "https://web.plaud.ai/file/";
+  const safeUrl = String(url || "").trim() || DEFAULT_WEB_FILE_URL;
   const waitDuration = Math.max(0, waitMs);
 
   if (openUrl) {
@@ -1110,10 +1428,15 @@ function extractTokenViaWindowsStorage({
     .slice(0, 30);
   const bestToken = tokenCandidates[0] || "";
   const bestSource = orderedRanked[0]?.source || "";
+  const apiOriginCandidates = resolvePlaudApiOriginCandidates({
+    apiOrigins: orderedRanked.map((item) => item?.apiOrigin).filter(Boolean),
+    pageUrl: safeUrl,
+  });
 
   return {
     token: normalizeToken(bestToken),
     tokenCandidates,
+    apiOriginCandidates,
     candidateCount: tokenCandidates.length,
     candidateSource: bestSource,
     requestHeaderCandidateCount: requestHeaderRanked.length,
@@ -1225,12 +1548,12 @@ function runAppleScript(scriptText, timeoutMs) {
 function extractTokenViaBrowserAutomation({
   browser = "chrome",
   openUrl = true,
-  url = "https://web.plaud.ai/file/",
+  url = DEFAULT_WEB_FILE_URL,
   waitMs = 7000,
 } = {}) {
   if (process.platform === "darwin") {
     const appName = resolveBrowserAppName(browser);
-    const safeUrl = String(url || "").trim() || "https://web.plaud.ai/file/";
+    const safeUrl = String(url || "").trim() || DEFAULT_WEB_FILE_URL;
     const waitSeconds = Math.max(1, Math.ceil(waitMs / 1000));
     const jsScript = buildBrowserTokenExtractorJs();
 
@@ -1253,7 +1576,15 @@ function extractTokenViaBrowserAutomation({
 
     const stdout = runAppleScript(lines.join("\n"), waitMs + 20000);
     const token = normalizeToken(stdout === "missing value" ? "" : stdout);
-    return { token, appName, url: safeUrl, openUrl, waitMs };
+    return {
+      token,
+      tokenCandidates: token ? [token] : [],
+      apiOriginCandidates: resolvePlaudApiOriginCandidates({ pageUrl: safeUrl }),
+      appName,
+      url: safeUrl,
+      openUrl,
+      waitMs,
+    };
   }
 
   if (process.platform === "win32") {
@@ -1506,10 +1837,58 @@ function buildTranscriptTextForSummary(transResult) {
   return lines.join("\n").trim();
 }
 
+function shouldTryAnotherApiOrigin(error) {
+  const statusCode = Number(error?.plaudStatusCode);
+  if (Number.isFinite(statusCode)) {
+    if (statusCode === 401 || statusCode === 403) return false;
+    return true;
+  }
+
+  const apiStatus = Number(error?.plaudApiStatus);
+  if (Number.isFinite(apiStatus)) {
+    if (apiStatus === 401 || apiStatus === 403) return false;
+    return true;
+  }
+
+  return true;
+}
+
+function formatApiOriginAttemptErrors(errors) {
+  const list = Array.isArray(errors) ? errors : [];
+  if (!list.length) return "unknown error";
+  return list
+    .slice(0, 4)
+    .map((item) => {
+      const origin = String(item?.origin || "").trim() || "unknown-origin";
+      const message = String(item?.message || "").trim() || "request failed";
+      return `${origin}: ${message}`;
+    })
+    .join(" | ");
+}
+
 class PlaudClient {
-  constructor({ token, apiOrigin }) {
+  constructor({ token, apiOrigin, apiOrigins = [] }) {
     this.token = normalizeToken(token);
-    this.apiOrigin = normalizeApiOrigin(apiOrigin) || DEFAULT_API_ORIGIN;
+    this.apiOrigin = DEFAULT_API_ORIGIN;
+    this.apiOrigins = [DEFAULT_API_ORIGIN];
+    this.mergeApiOrigins([apiOrigin, ...normalizeApiOriginList(apiOrigins), DEFAULT_API_ORIGIN]);
+  }
+
+  mergeApiOrigins(origins) {
+    const list = Array.isArray(origins) ? origins : [origins];
+    const merged = dedupeApiOrigins([...list, ...this.apiOrigins, DEFAULT_API_ORIGIN]);
+    this.apiOrigins = merged.length ? merged : [DEFAULT_API_ORIGIN];
+    this.apiOrigin = this.apiOrigins[0];
+  }
+
+  setApiOrigin(origin) {
+    const normalized = normalizeApiOrigin(origin);
+    if (!normalized) return;
+    this.mergeApiOrigins([normalized, ...this.apiOrigins]);
+  }
+
+  getApiOriginCandidates() {
+    return this.apiOrigins.length ? this.apiOrigins : [this.apiOrigin || DEFAULT_API_ORIGIN];
   }
 
   buildHeaders(includeJsonBody) {
@@ -1524,49 +1903,84 @@ class PlaudClient {
     return headers;
   }
 
-  buildUrl(pathname) {
-    return new URL(pathname, this.apiOrigin).toString();
+  buildUrl(pathname, origin = this.apiOrigin) {
+    return new URL(pathname, origin || this.apiOrigin).toString();
   }
 
   async requestJson({ method = "GET", pathname = "", absoluteUrl = "", body = null, retry = 0 }) {
-    const requestUrl = absoluteUrl || this.buildUrl(pathname);
-    const response = await fetch(requestUrl, {
-      method,
-      headers: this.buildHeaders(body != null),
-      body: body == null ? undefined : JSON.stringify(body),
-    });
+    const origins = this.getApiOriginCandidates();
+    const errors = [];
 
-    const text = await response.text();
-    const parsed = safeJsonParse(text) ?? { raw: text };
+    for (let index = 0; index < origins.length; index += 1) {
+      const attemptOrigin = origins[index];
+      const requestUrl = absoluteUrl
+        ? replaceUrlOrigin(absoluteUrl, attemptOrigin)
+        : this.buildUrl(pathname, attemptOrigin);
 
-    if (parsed?.status === -302 && parsed?.data?.domains?.api && retry < 2) {
-      const redirectedOrigin = normalizeApiOrigin(parsed.data.domains.api);
-      if (redirectedOrigin && redirectedOrigin !== this.apiOrigin) {
-        this.apiOrigin = redirectedOrigin;
-        const retriedUrl = absoluteUrl ? replaceUrlOrigin(requestUrl, redirectedOrigin) : "";
-        return this.requestJson({
+      try {
+        const response = await fetch(requestUrl, {
           method,
-          pathname,
-          absoluteUrl: retriedUrl,
-          body,
-          retry: retry + 1,
+          headers: this.buildHeaders(body != null),
+          body: body == null ? undefined : JSON.stringify(body),
         });
+
+        const text = await response.text();
+        const parsed = safeJsonParse(text) ?? { raw: text };
+
+        const redirectedOrigin = parsed?.status === -302 && retry < 2
+          ? extractRedirectApiOrigin(parsed)
+          : "";
+        if (redirectedOrigin && redirectedOrigin !== attemptOrigin) {
+          this.setApiOrigin(redirectedOrigin);
+          const retriedUrl = absoluteUrl ? replaceUrlOrigin(requestUrl, redirectedOrigin) : "";
+          return this.requestJson({
+            method,
+            pathname,
+            absoluteUrl: retriedUrl,
+            body,
+            retry: retry + 1,
+          });
+        }
+
+        if (!response.ok) {
+          const httpError = new Error(
+            `PLAUD API request failed (HTTP ${response.status}): ${text.slice(0, 200)}`
+          );
+          httpError.plaudStatusCode = response.status;
+          throw httpError;
+        }
+
+        if (typeof parsed?.status === "number" && parsed.status !== 0) {
+          const apiError = new Error(
+            parsed?.msg || `PLAUD API returned non-zero status: ${parsed.status}`
+          );
+          apiError.plaudApiStatus = parsed.status;
+          throw apiError;
+        }
+
+        this.setApiOrigin(attemptOrigin);
+        return {
+          data: parsed,
+          rawText: text,
+          requestUrl: response.url || requestUrl,
+          statusCode: response.status,
+        };
+      } catch (err) {
+        errors.push({
+          origin: attemptOrigin,
+          message: err?.message || String(err),
+        });
+        const hasNextOrigin = index < origins.length - 1;
+        if (!hasNextOrigin || !shouldTryAnotherApiOrigin(err)) {
+          if (errors.length <= 1) throw err;
+          throw new Error(
+            `PLAUD API request failed across ${errors.length} origins: ${formatApiOriginAttemptErrors(errors)}`
+          );
+        }
       }
     }
 
-    if (!response.ok) {
-      throw new Error(`PLAUD API request failed (HTTP ${response.status}): ${text.slice(0, 200)}`);
-    }
-    if (typeof parsed?.status === "number" && parsed.status !== 0) {
-      throw new Error(parsed?.msg || `PLAUD API returned non-zero status: ${parsed.status}`);
-    }
-
-    return {
-      data: parsed,
-      rawText: text,
-      requestUrl: response.url || requestUrl,
-      statusCode: response.status,
-    };
+    throw new Error("PLAUD API request failed (no reachable origin).");
   }
 
   async listFiles({ skip, limit, isTrash }) {
@@ -1599,13 +2013,17 @@ class PlaudClient {
   }
 }
 
-async function verifyPlaudTokenCandidate(token, apiOrigin) {
+async function verifyPlaudTokenCandidate(token, apiOrigin, apiOrigins = []) {
   const normalized = normalizeToken(token);
   if (!normalized) {
     return { ok: false, token: "", requestUrl: "", apiOrigin: "", error: "empty token" };
   }
 
-  const candidateClient = new PlaudClient({ token: normalized, apiOrigin });
+  const candidateClient = new PlaudClient({
+    token: normalized,
+    apiOrigin,
+    apiOrigins,
+  });
   try {
     const response = await candidateClient.listFiles({ skip: 0, limit: 1, isTrash: 2 });
     return {
@@ -1627,23 +2045,30 @@ async function verifyPlaudTokenCandidate(token, apiOrigin) {
 }
 
 async function pickFirstValidPlaudToken(candidates, options = {}) {
-  const configuredOrigin = normalizeApiOrigin(options?.apiOrigin) || DEFAULT_API_ORIGIN;
+  const configuredOrigins = resolvePlaudApiOriginCandidates({
+    apiOrigin: options?.apiOrigin,
+    apiOrigins: options?.apiOrigins,
+    pageUrl: options?.pageUrl,
+    currentOrigin: options?.currentOrigin,
+  });
+  const configuredOrigin = configuredOrigins[0] || DEFAULT_API_ORIGIN;
   const list = Array.isArray(candidates) ? candidates : [candidates];
   const unique = Array.from(new Set(list.map((item) => normalizeToken(item)).filter(Boolean)));
   const maxChecks = clampInteger(options?.maxChecks, {
-    defaultValue: 8,
+    defaultValue: 12,
     min: 1,
-    max: 30,
+    max: 60,
   });
   const checked = [];
 
   for (let index = 0; index < unique.length && index < maxChecks; index += 1) {
     const candidate = unique[index];
-    const probe = await verifyPlaudTokenCandidate(candidate, configuredOrigin);
+    const probe = await verifyPlaudTokenCandidate(candidate, configuredOrigin, configuredOrigins);
     checked.push({
       index,
       ok: probe.ok,
       error: probe.error,
+      api_origin: probe.apiOrigin || configuredOrigin,
       token_masked: maskToken(candidate),
     });
     if (probe.ok) {
@@ -1651,6 +2076,7 @@ async function pickFirstValidPlaudToken(candidates, options = {}) {
         ok: true,
         token: probe.token,
         apiOrigin: probe.apiOrigin,
+        apiOrigins: dedupeApiOrigins([probe.apiOrigin, ...configuredOrigins]),
         requestUrl: probe.requestUrl,
         checked,
       };
@@ -1661,6 +2087,7 @@ async function pickFirstValidPlaudToken(candidates, options = {}) {
     ok: false,
     token: "",
     apiOrigin: configuredOrigin,
+    apiOrigins: configuredOrigins,
     requestUrl: "",
     checked,
   };
@@ -1840,63 +2267,115 @@ async function extractSummaryEntriesFromFileDetail(detailData, options = {}) {
 
 let runtimePlaudToken = "";
 let runtimePlaudTokenSource = "";
+let runtimePlaudApiOrigins = [];
 
 function setRuntimePlaudToken(token, source = "runtime") {
-  runtimePlaudToken = normalizeToken(token);
+  const normalized = normalizeToken(token);
+  const previous = runtimePlaudToken;
+  runtimePlaudToken = normalized;
   runtimePlaudTokenSource = runtimePlaudToken ? String(source || "runtime") : "";
+  if (!runtimePlaudToken || runtimePlaudToken !== previous) {
+    runtimePlaudApiOrigins = [];
+  }
 }
 
-function resolvePlaudToken() {
+function setRuntimePlaudApiOrigins(origins) {
+  runtimePlaudApiOrigins = dedupeApiOrigins(origins);
+}
+
+function resolvePreferredTokenFilePath() {
+  const explicit = String(process.env.PLAUD_TOKEN_FILE || "").trim();
+  if (explicit) return explicit;
+  if (isAutoPersistDisabled()) return "";
+  return DEFAULT_AUTO_TOKEN_PATH;
+}
+
+function resolvePlaudTokenState() {
   const runtimeToken = normalizeToken(runtimePlaudToken);
-  if (runtimeToken) return runtimeToken;
+  if (runtimeToken) {
+    return {
+      token: runtimeToken,
+      source: runtimePlaudTokenSource || "runtime",
+      tokenFilePath: "",
+    };
+  }
 
   const directToken = normalizeToken(
     process.env.PLAUD_TOKEN || process.env.PLAUD_BEARER_TOKEN || process.env.PLAUD_AUTH_TOKEN
   );
-  if (directToken) return directToken;
+  if (directToken) {
+    return {
+      token: directToken,
+      source: "env",
+      tokenFilePath: resolvePreferredTokenFilePath(),
+    };
+  }
 
   const tokenFile = String(process.env.PLAUD_TOKEN_FILE || "").trim();
   const explicitFileToken = readTokenFromFile(tokenFile);
-  if (explicitFileToken) return explicitFileToken;
+  if (explicitFileToken) {
+    return {
+      token: explicitFileToken,
+      source: "token_file",
+      tokenFilePath: tokenFile,
+    };
+  }
 
-  if (isAutoPersistDisabled()) return "";
-  return readTokenFromFile(DEFAULT_AUTO_TOKEN_PATH);
+  if (!isAutoPersistDisabled()) {
+    const autoFileToken = readTokenFromFile(DEFAULT_AUTO_TOKEN_PATH);
+    if (autoFileToken) {
+      return {
+        token: autoFileToken,
+        source: "persisted_file",
+        tokenFilePath: DEFAULT_AUTO_TOKEN_PATH,
+      };
+    }
+  }
+
+  return {
+    token: "",
+    source: "",
+    tokenFilePath: resolvePreferredTokenFilePath(),
+  };
+}
+
+function resolvePlaudToken() {
+  return resolvePlaudTokenState().token;
 }
 
 function resolvePlaudTokenSource() {
-  if (normalizeToken(runtimePlaudToken)) return runtimePlaudTokenSource || "runtime";
-  if (
-    normalizeToken(process.env.PLAUD_TOKEN) ||
-    normalizeToken(process.env.PLAUD_BEARER_TOKEN) ||
-    normalizeToken(process.env.PLAUD_AUTH_TOKEN)
-  ) {
-    return "env";
-  }
-  if (String(process.env.PLAUD_TOKEN_FILE || "").trim()) return "token_file";
-  if (!isAutoPersistDisabled() && readTokenFromFile(DEFAULT_AUTO_TOKEN_PATH)) {
-    return "persisted_file";
-  }
-  return "";
+  return resolvePlaudTokenState().source;
 }
 
 let plaudClient = null;
 
 function getPlaudClient() {
-  const token = resolvePlaudToken();
+  const tokenState = resolvePlaudTokenState();
+  const token = tokenState.token;
   if (!token) {
     throw new Error(
       "Missing PLAUD token. Set PLAUD_TOKEN (or PLAUD_BEARER_TOKEN / PLAUD_AUTH_TOKEN / PLAUD_TOKEN_FILE), or call plaud_auth_browser first."
     );
   }
 
-  const configuredOrigin = normalizeApiOrigin(process.env.PLAUD_API_ORIGIN) || DEFAULT_API_ORIGIN;
-  const keepOrigin = plaudClient?.apiOrigin || configuredOrigin;
+  const persistedApiStatePath = resolveApiOriginStateFilePath(tokenState.tokenFilePath);
+  const persistedApiState = readApiOriginStateFromFile(persistedApiStatePath, token);
+  const runtimeOrigins = tokenState.source === "runtime" ? runtimePlaudApiOrigins : [];
+  const configuredOrigins = resolvePlaudApiOriginCandidates({
+    apiOrigin: process.env.PLAUD_API_ORIGIN,
+    apiOrigins: [...runtimeOrigins, ...(persistedApiState.apiOrigins || [])],
+    currentOrigin: plaudClient?.apiOrigin,
+  });
+  const keepOrigin = configuredOrigins[0] || DEFAULT_API_ORIGIN;
 
   if (!plaudClient || plaudClient.token !== token) {
     plaudClient = new PlaudClient({
       token,
       apiOrigin: keepOrigin,
+      apiOrigins: configuredOrigins,
     });
+  } else {
+    plaudClient.mergeApiOrigins(configuredOrigins);
   }
   return plaudClient;
 }
@@ -1906,7 +2385,7 @@ async function handleAuthBrowser(args) {
     .trim()
     .toLowerCase();
   const openUrl = toBoolean(args?.open_url, true);
-  const targetUrl = String(args?.url || "https://web.plaud.ai/file/").trim();
+  const targetUrl = String(args?.url || DEFAULT_WEB_FILE_URL).trim();
   const waitMs = clampInteger(args?.wait_ms, { defaultValue: 7000, min: 1000, max: 30000 });
   const saveToFile = String(args?.save_to_file || "").trim();
   const returnToken = toBoolean(args?.return_token, false);
@@ -1916,12 +2395,45 @@ async function handleAuthBrowser(args) {
     ? ""
     : (saveToFile || DEFAULT_AUTO_TOKEN_PATH);
 
-  const result = extractTokenViaBrowserAutomation({
-    browser,
-    openUrl,
-    url: targetUrl,
-    waitMs,
-  });
+  const authUrlCandidates = openUrl
+    ? buildPlaudPageUrlCandidates(targetUrl)
+    : [targetUrl || DEFAULT_WEB_FILE_URL];
+  const attemptedUrls = [];
+  let result = null;
+  let lastExtractionError = null;
+
+  for (let index = 0; index < authUrlCandidates.length; index += 1) {
+    const attemptUrl = authUrlCandidates[index];
+    attemptedUrls.push(attemptUrl);
+    try {
+      const attempt = extractTokenViaBrowserAutomation({
+        browser,
+        openUrl,
+        url: attemptUrl,
+        waitMs,
+      });
+      if (!result) {
+        result = attempt;
+      }
+      const attemptCandidates = Array.isArray(attempt?.tokenCandidates)
+        ? attempt.tokenCandidates
+        : [attempt?.token];
+      const hasValidCandidate = attemptCandidates
+        .map((item) => normalizeToken(item))
+        .filter(Boolean)
+        .length > 0;
+      if (hasValidCandidate) {
+        result = attempt;
+        break;
+      }
+    } catch (err) {
+      lastExtractionError = err;
+    }
+  }
+
+  if (!result && lastExtractionError) {
+    throw lastExtractionError;
+  }
 
   const tokenCandidates = Array.isArray(result?.tokenCandidates)
     ? result.tokenCandidates
@@ -1929,13 +2441,23 @@ async function handleAuthBrowser(args) {
   const normalizedCandidates = tokenCandidates.map((item) => normalizeToken(item)).filter(Boolean);
   if (!normalizedCandidates.length) {
     throw new Error(
-      "No PLAUD token captured. Please ensure browser is logged in, keep web.plaud.ai open, and retry."
+      "No PLAUD token captured. Please ensure browser is logged in, keep web.plaud.ai or app.plaud.ai open, and retry."
     );
   }
 
-  const validation = await pickFirstValidPlaudToken(normalizedCandidates, {
+  const apiOriginCandidates = resolvePlaudApiOriginCandidates({
     apiOrigin: process.env.PLAUD_API_ORIGIN,
-    maxChecks: 8,
+    apiOrigins: result?.apiOriginCandidates,
+    pageUrl: result?.url || targetUrl,
+    currentOrigin: plaudClient?.apiOrigin,
+  });
+
+  const validation = await pickFirstValidPlaudToken(normalizedCandidates, {
+    apiOrigin: apiOriginCandidates[0],
+    apiOrigins: apiOriginCandidates,
+    pageUrl: result?.url || targetUrl,
+    currentOrigin: plaudClient?.apiOrigin,
+    maxChecks: 12,
   });
   if (!validation.ok || !validation.token) {
     const firstError = validation.checked.find((item) => !item.ok)?.error || "unknown error";
@@ -1946,12 +2468,20 @@ async function handleAuthBrowser(args) {
 
   const token = validation.token;
   setRuntimePlaudToken(token, `browser:${result.appName}`);
+  const resolvedOrigins = dedupeApiOrigins([
+    validation.apiOrigin,
+    ...(validation.apiOrigins || []),
+    ...apiOriginCandidates,
+  ]);
+  setRuntimePlaudApiOrigins(resolvedOrigins);
   plaudClient = new PlaudClient({
     token,
-    apiOrigin: validation.apiOrigin || normalizeApiOrigin(process.env.PLAUD_API_ORIGIN) || DEFAULT_API_ORIGIN,
+    apiOrigin: validation.apiOrigin || resolvedOrigins[0] || DEFAULT_API_ORIGIN,
+    apiOrigins: resolvedOrigins,
   });
 
   let savedPath = "";
+  let savedApiOriginsPath = "";
   let persistMode = "none";
   let persistError = "";
   if (autoPersistDisabled && saveToFile) {
@@ -1967,6 +2497,25 @@ async function handleAuthBrowser(args) {
     } else {
       savedPath = persisted.path;
       persistMode = saveToFile ? "explicit" : "auto_default";
+      const apiOriginStatePath = resolveApiOriginStateFilePath(savedPath || persistTargetPath);
+      const persistedApiOrigins = persistApiOriginStateToFile({
+        token,
+        apiOrigin: validation.apiOrigin || resolvedOrigins[0],
+        apiOrigins: resolvedOrigins,
+        filePath: apiOriginStatePath,
+      });
+      if (!persistedApiOrigins.ok) {
+        if (saveToFile) {
+          throw new Error(
+            `Failed to persist API origin state file for save_to_file: ${persistedApiOrigins.error}`
+          );
+        }
+        persistError = persistError
+          ? `${persistError} | ${persistedApiOrigins.error}`
+          : persistedApiOrigins.error;
+      } else {
+        savedApiOriginsPath = persistedApiOrigins.path;
+      }
     }
   }
 
@@ -1978,9 +2527,12 @@ async function handleAuthBrowser(args) {
     browser: browser,
     browser_app: result.appName,
     opened_url: result.openUrl ? result.url : "",
+    attempted_urls: attemptedUrls,
     wait_ms: waitMs,
     token_candidate_source: String(result.candidateSource || ""),
     request_header_candidates: Number(result.requestHeaderCandidateCount || 0),
+    api_origin: validation.apiOrigin || "",
+    api_origin_candidates: resolvedOrigins,
     validated: true,
     validated_request_url: validation.requestUrl || "",
     token_candidates_checked: validation.checked.length,
@@ -1988,6 +2540,7 @@ async function handleAuthBrowser(args) {
     persist_mode: persistMode,
     persist_error: persistError,
     saved_to_file: savedPath,
+    saved_api_origins_file: savedApiOriginsPath,
     return_token_requested: returnToken,
     return_token: false,
     token: "",
