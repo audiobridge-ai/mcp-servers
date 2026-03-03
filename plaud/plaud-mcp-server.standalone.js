@@ -4,7 +4,7 @@
 // Source: mcp/plaud-mcp-server.js
 // Build command: npm run mcp:build-standalone
 
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -634,13 +634,19 @@ const TOOLS = [
   {
     name: TOOL_GET_FILE_AUDIO,
     description:
-      "Get PLAUD audio temp_url by file_id, and optionally download/save/return the audio bytes.",
+      "Get PLAUD audio temp_url by file_id(s), and optionally download/save/return the audio bytes.",
     inputSchema: {
       type: "object",
       properties: {
         file_id: {
           type: "string",
-          description: "PLAUD file id.",
+          description: "Single PLAUD file id.",
+        },
+        file_ids: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+          description: "Multiple PLAUD file ids for batch mode.",
         },
         download: {
           type: "boolean",
@@ -649,7 +655,12 @@ const TOOLS = [
         },
         save_to_file: {
           type: "string",
-          description: "Optional local output file path for downloaded audio.",
+          description: "Optional local output file path (single-file mode only).",
+        },
+        save_to_dir: {
+          type: "string",
+          description:
+            "Optional local output directory for batch or single mode; auto-generates filename by file_id.",
         },
         return_base64: {
           type: "boolean",
@@ -667,8 +678,19 @@ const TOOLS = [
           description:
             "Max download bytes. Defaults: 20MB when return_base64=true, otherwise 500MB.",
         },
+        download_concurrency: {
+          type: "integer",
+          minimum: 1,
+          maximum: 8,
+          default: 3,
+          description: "Batch download concurrency (only for multi-file mode).",
+        },
+        continue_on_error: {
+          type: "boolean",
+          default: true,
+          description: "When batch mode fails for one file, continue remaining files.",
+        },
       },
-      required: ["file_id"],
       additionalProperties: false,
     },
   },
@@ -1117,6 +1139,157 @@ function persistBinaryToFile(buffer, filePath) {
   } catch (err) {
     return { ok: false, path: pathText, error: err?.message || String(err) };
   }
+}
+
+function collectAudioFileIds(args) {
+  const output = [];
+  const dedupe = new Set();
+  const push = (value) => {
+    const id = String(value || "").trim();
+    if (!id) return;
+    if (dedupe.has(id)) return;
+    dedupe.add(id);
+    output.push(id);
+  };
+
+  push(pickNonEmptyString(args?.file_id, args?.fileId));
+
+  const list = Array.isArray(args?.file_ids)
+    ? args.file_ids
+    : Array.isArray(args?.fileIds)
+      ? args.fileIds
+      : [];
+  for (const item of list) {
+    push(item);
+  }
+
+  const hasFileIdsArray = Array.isArray(args?.file_ids) || Array.isArray(args?.fileIds);
+  return {
+    fileIds: output,
+    hasFileIdsArray,
+  };
+}
+
+function sanitizeFileNameSegment(value, fallback = "plaud-audio") {
+  const raw = String(value || "").trim();
+  const cleaned = raw
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/^_+/, "")
+    .replace(/_+$/, "");
+  if (!cleaned || cleaned === "." || cleaned === "..") return fallback;
+  return cleaned.slice(0, 120);
+}
+
+function inferFileExtensionFromUrl(url) {
+  const raw = String(url || "").trim();
+  if (!raw) return "";
+
+  let pathname = "";
+  try {
+    pathname = new URL(raw).pathname || "";
+  } catch {
+    pathname = raw.split(/[?#]/)[0] || "";
+  }
+
+  const basename = pathname.split("/").pop() || "";
+  const match = basename.match(/\.([A-Za-z0-9]{1,8})$/);
+  return match?.[1] ? match[1].toLowerCase() : "";
+}
+
+function inferAudioFileExtension(contentType, url) {
+  const normalizedType = String(contentType || "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+  const mapped =
+    normalizedType === "audio/mpeg" || normalizedType === "audio/mp3"
+      ? "mp3"
+      : normalizedType === "audio/wav" ||
+          normalizedType === "audio/x-wav" ||
+          normalizedType === "audio/wave"
+        ? "wav"
+        : normalizedType === "audio/mp4" || normalizedType === "audio/x-m4a"
+          ? "m4a"
+          : normalizedType === "audio/aac"
+            ? "aac"
+            : normalizedType === "audio/ogg"
+              ? "ogg"
+              : normalizedType === "audio/webm"
+                ? "webm"
+                : normalizedType === "audio/flac" || normalizedType === "audio/x-flac"
+                  ? "flac"
+                  : normalizedType === "audio/amr"
+                    ? "amr"
+                    : normalizedType === "audio/3gpp"
+                      ? "3gp"
+                      : normalizedType === "audio/3gpp2"
+                        ? "3g2"
+                        : "";
+  if (mapped) return mapped;
+
+  const extFromUrl = inferFileExtensionFromUrl(url);
+  if (extFromUrl) return extFromUrl;
+
+  return "bin";
+}
+
+function resolveUniqueFilePath(filePath) {
+  const pathText = String(filePath || "").trim();
+  if (!pathText) return "";
+  if (!existsSync(pathText)) return pathText;
+
+  const slashIndex = Math.max(pathText.lastIndexOf("/"), pathText.lastIndexOf("\\"));
+  const dotIndex = pathText.lastIndexOf(".");
+  const hasExtension = dotIndex > slashIndex;
+  const prefix = hasExtension ? pathText.slice(0, dotIndex) : pathText;
+  const suffix = hasExtension ? pathText.slice(dotIndex) : "";
+
+  for (let i = 1; i <= 9999; i += 1) {
+    const candidate = `${prefix}-${i}${suffix}`;
+    if (!existsSync(candidate)) return candidate;
+  }
+  return `${prefix}-${Date.now()}${suffix}`;
+}
+
+function buildAudioOutputFilePath({ saveToFile, saveToDir, fileId, contentType, downloadUrl }) {
+  const directFile = String(saveToFile || "").trim();
+  if (directFile) return directFile;
+
+  const directory = String(saveToDir || "").trim();
+  if (!directory) return "";
+
+  const stem = sanitizeFileNameSegment(fileId, "plaud-audio");
+  const ext = inferAudioFileExtension(contentType, downloadUrl);
+  const candidate = join(directory, `${stem}.${ext}`);
+  return resolveUniqueFilePath(candidate);
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) return [];
+
+  const limit = clampInteger(concurrency, { defaultValue: 3, min: 1, max: 32 });
+  const workerCount = Math.min(limit, list.length);
+  const results = new Array(list.length);
+  let cursor = 0;
+
+  const workers = [];
+  for (let workerIndex = 0; workerIndex < workerCount; workerIndex += 1) {
+    workers.push(
+      (async () => {
+        while (true) {
+          const index = cursor;
+          cursor += 1;
+          if (index >= list.length) return;
+          results[index] = await mapper(list[index], index);
+        }
+      })()
+    );
+  }
+
+  await Promise.all(workers);
+  return results;
 }
 
 function toAppleScriptString(value) {
@@ -2815,18 +2988,14 @@ async function handleGetFileData(args) {
   return result;
 }
 
-async function handleGetFileAudio(args) {
-  const client = getPlaudClient();
-  const fileId = pickNonEmptyString(args?.file_id, args?.fileId);
-  if (!fileId) throw new Error("Missing file_id");
-
-  const saveToFile = String(args?.save_to_file || "").trim();
-  const returnBase64 = toBoolean(args?.return_base64, false);
-  const includeDataUrl = returnBase64 && toBoolean(args?.include_data_url, false);
-  const explicitDownload = toBoolean(args?.download, false);
-  const shouldDownload = explicitDownload || Boolean(saveToFile) || returnBase64;
+async function loadSingleFileAudioPayload(client, fileId, options = {}) {
+  const shouldDownload = toBoolean(options?.shouldDownload, false);
+  const saveToFile = String(options?.saveToFile || "").trim();
+  const saveToDir = String(options?.saveToDir || "").trim();
+  const returnBase64 = toBoolean(options?.returnBase64, false);
+  const includeDataUrl = returnBase64 && toBoolean(options?.includeDataUrl, false);
   const defaultMaxBytes = returnBase64 ? 20 * 1024 * 1024 : 500 * 1024 * 1024;
-  const maxBytes = clampInteger(args?.max_bytes, {
+  const maxBytes = clampInteger(options?.maxBytes, {
     defaultValue: defaultMaxBytes,
     min: 1,
     max: 1_000_000_000,
@@ -2855,8 +3024,15 @@ async function handleGetFileAudio(args) {
     returned_base64: returnBase64,
   };
 
-  if (saveToFile) {
-    const persisted = persistBinaryToFile(downloaded.buffer, saveToFile);
+  const outputPath = buildAudioOutputFilePath({
+    saveToFile,
+    saveToDir,
+    fileId,
+    contentType: downloaded.contentType,
+    downloadUrl: downloaded.requestUrl || tempUrlResp.tempUrl,
+  });
+  if (outputPath) {
+    const persisted = persistBinaryToFile(downloaded.buffer, outputPath);
     if (!persisted.ok) {
       throw new Error(`Failed to save audio file: ${persisted.error}`);
     }
@@ -2874,6 +3050,119 @@ async function handleGetFileAudio(args) {
 
   result.audio = audio;
   return result;
+}
+
+async function handleGetFileAudio(args) {
+  const client = getPlaudClient();
+  const singleFileIdInput = pickNonEmptyString(args?.file_id, args?.fileId);
+  const { fileIds, hasFileIdsArray } = collectAudioFileIds(args || {});
+  if (!fileIds.length) throw new Error("Missing file_id or file_ids");
+
+  const saveToFile = String(args?.save_to_file || "").trim();
+  const saveToDir = String(args?.save_to_dir || "").trim();
+  if (saveToFile && saveToDir) {
+    throw new Error("save_to_file and save_to_dir cannot be used together.");
+  }
+
+  const returnBase64 = toBoolean(args?.return_base64, false);
+  const includeDataUrl = returnBase64 && toBoolean(args?.include_data_url, false);
+  const explicitDownload = toBoolean(args?.download, false);
+  const shouldDownload = explicitDownload || Boolean(saveToFile) || Boolean(saveToDir) || returnBase64;
+  const defaultMaxBytes = returnBase64 ? 20 * 1024 * 1024 : 500 * 1024 * 1024;
+  const maxBytes = clampInteger(args?.max_bytes, {
+    defaultValue: defaultMaxBytes,
+    min: 1,
+    max: 1_000_000_000,
+  });
+  const isBatchMode = fileIds.length > 1 || (!singleFileIdInput && hasFileIdsArray);
+  const downloadConcurrency = clampInteger(args?.download_concurrency, {
+    defaultValue: 3,
+    min: 1,
+    max: 8,
+  });
+  const continueOnError = toBoolean(args?.continue_on_error, true);
+
+  if (isBatchMode && saveToFile) {
+    throw new Error("save_to_file is only supported in single-file mode. Use save_to_dir in batch mode.");
+  }
+
+  if (!isBatchMode) {
+    return loadSingleFileAudioPayload(client, fileIds[0], {
+      shouldDownload,
+      saveToFile,
+      saveToDir,
+      returnBase64,
+      includeDataUrl,
+      maxBytes,
+    });
+  }
+
+  const normalizeBatchItem = (item) => {
+    const out = {
+      ok: true,
+      file_id: item.file_id,
+      request_url: item.request_url,
+      temp_url: item.temp_url,
+      download_performed: item.download_performed,
+    };
+    if (item.audio) out.audio = item.audio;
+    return out;
+  };
+
+  let results = [];
+  if (!continueOnError) {
+    for (const fileId of fileIds) {
+      try {
+        const item = await loadSingleFileAudioPayload(client, fileId, {
+          shouldDownload,
+          saveToDir,
+          returnBase64,
+          includeDataUrl,
+          maxBytes,
+        });
+        results.push(normalizeBatchItem(item));
+      } catch (err) {
+        const message = err?.message || String(err);
+        throw new Error(`Failed to fetch audio for file_id=${fileId}: ${message}`);
+      }
+    }
+  } else {
+    results = await mapWithConcurrency(fileIds, downloadConcurrency, async (fileId) => {
+      try {
+        const item = await loadSingleFileAudioPayload(client, fileId, {
+          shouldDownload,
+          saveToDir,
+          returnBase64,
+          includeDataUrl,
+          maxBytes,
+        });
+        return normalizeBatchItem(item);
+      } catch (err) {
+        return {
+          ok: false,
+          file_id: fileId,
+          error: err?.message || String(err),
+        };
+      }
+    });
+  }
+
+  const success = results.filter((item) => item?.ok).length;
+  const failed = results.length - success;
+  return {
+    api_origin: client.apiOrigin,
+    mode: "batch",
+    count: results.length,
+    success,
+    failed,
+    download_performed: shouldDownload,
+    return_base64: returnBase64,
+    save_to_dir: saveToDir,
+    max_bytes: maxBytes,
+    download_concurrency: downloadConcurrency,
+    continue_on_error: continueOnError,
+    results,
+  };
 }
 
 function buildToolTextResult(payload) {

@@ -97,6 +97,12 @@ Download and save to local file:
 Call MCP tool plaud_get_file_audio with arguments {"file_id":"<YOUR_FILE_ID>","download":true,"save_to_file":"/absolute/path/plaud-audio.mp3"}.
 ```
 
+Batch download and save into one directory:
+
+```text
+Call MCP tool plaud_get_file_audio with arguments {"file_ids":["<FILE_ID_1>","<FILE_ID_2>"],"download":true,"save_to_dir":"/absolute/path/plaud-audios","download_concurrency":3,"continue_on_error":true}.
+```
+
 ## Optional: Use Token Directly (No Browser Auth)
 
 If you already have a PLAUD token:
