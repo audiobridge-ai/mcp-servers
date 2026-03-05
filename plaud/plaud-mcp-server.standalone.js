@@ -4,11 +4,11 @@
 // Source: mcp/plaud-mcp-server.js
 // Build command: npm run mcp:build-standalone
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { gunzipSync } from "node:zlib";
 
 const { normalizeTranscriptionToTransResult } = (() => {
@@ -510,6 +510,11 @@ const TOOL_LIST_FILES = "plaud_list_files";
 const TOOL_GET_FILE_DATA = "plaud_get_file_data";
 const TOOL_GET_FILE_AUDIO = "plaud_get_file_audio";
 const TOOL_AUTH_BROWSER = "plaud_auth_browser";
+const AUDIO_FORMAT_ORIGINAL = "original";
+const AUDIO_FORMAT_WAV = "wav";
+const TOOL_HEARTBEAT_INTERVAL_MS = 10_000;
+const AUDIO_RESULT_CACHE_TTL_MS = 5 * 60 * 1000;
+const AUDIO_RESULT_CACHE_MAX_ENTRIES = 120;
 const TRANSCRIPT_FORMAT_JSON = "json";
 const TRANSCRIPT_FORMAT_SRT = "srt";
 const TRANSCRIPT_FORMAT_VTT = "vtt";
@@ -647,6 +652,12 @@ const TOOLS = [
           items: { type: "string" },
           minItems: 1,
           description: "Multiple PLAUD file ids for batch mode.",
+        },
+        audio_format: {
+          type: "string",
+          enum: [AUDIO_FORMAT_ORIGINAL, AUDIO_FORMAT_WAV],
+          default: AUDIO_FORMAT_ORIGINAL,
+          description: "Audio export format: original/wav. wav requires ffmpeg.",
         },
         download: {
           type: "boolean",
@@ -1234,6 +1245,35 @@ function inferAudioFileExtension(contentType, url) {
   return "bin";
 }
 
+function normalizeAudioFormat(value) {
+  const raw = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (raw === AUDIO_FORMAT_WAV) return AUDIO_FORMAT_WAV;
+  return AUDIO_FORMAT_ORIGINAL;
+}
+
+function normalizeFileExtensionToken(value, fallback = "bin") {
+  const raw = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^\./, "");
+  if (!raw) return fallback;
+  if (!/^[a-z0-9]{1,10}$/.test(raw)) return fallback;
+  return raw;
+}
+
+function ensureFilePathExtension(filePath, extension) {
+  const pathText = String(filePath || "").trim();
+  if (!pathText) return "";
+  const ext = normalizeFileExtensionToken(extension, "bin");
+  const slashIndex = Math.max(pathText.lastIndexOf("/"), pathText.lastIndexOf("\\"));
+  const dotIndex = pathText.lastIndexOf(".");
+  const hasExtension = dotIndex > slashIndex;
+  if (!hasExtension) return `${pathText}.${ext}`;
+  return `${pathText.slice(0, dotIndex)}.${ext}`;
+}
+
 function resolveUniqueFilePath(filePath) {
   const pathText = String(filePath || "").trim();
   if (!pathText) return "";
@@ -1252,15 +1292,28 @@ function resolveUniqueFilePath(filePath) {
   return `${prefix}-${Date.now()}${suffix}`;
 }
 
-function buildAudioOutputFilePath({ saveToFile, saveToDir, fileId, contentType, downloadUrl }) {
+function buildAudioOutputFilePath({
+  saveToFile,
+  saveToDir,
+  fileId,
+  contentType,
+  downloadUrl,
+  forcedExtension,
+}) {
+  const normalizedForcedExt = normalizeFileExtensionToken(forcedExtension, "");
   const directFile = String(saveToFile || "").trim();
-  if (directFile) return directFile;
+  if (directFile) {
+    if (normalizedForcedExt) {
+      return ensureFilePathExtension(directFile, normalizedForcedExt);
+    }
+    return directFile;
+  }
 
   const directory = String(saveToDir || "").trim();
   if (!directory) return "";
 
   const stem = sanitizeFileNameSegment(fileId, "plaud-audio");
-  const ext = inferAudioFileExtension(contentType, downloadUrl);
+  const ext = normalizedForcedExt || inferAudioFileExtension(contentType, downloadUrl);
   const candidate = join(directory, `${stem}.${ext}`);
   return resolveUniqueFilePath(candidate);
 }
@@ -1290,6 +1343,126 @@ async function mapWithConcurrency(items, concurrency, mapper) {
 
   await Promise.all(workers);
   return results;
+}
+
+let ffmpegExecutableCache = "";
+let ffmpegExecutableCacheKey = "";
+
+function resolveConfiguredFfmpegExecutable() {
+  return String(process.env.PLAUD_FFMPEG_PATH || "").trim() || "ffmpeg";
+}
+
+function probeFfmpegExecutable(executable) {
+  const result = spawnSync(executable, ["-version"], {
+    encoding: "utf8",
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  if (result.error) {
+    throw new Error(result.error?.message || String(result.error));
+  }
+  if (result.status !== 0) {
+    const detail = String(result.stderr || result.stdout || "").trim();
+    throw new Error(detail || `exit code ${result.status}`);
+  }
+  return executable;
+}
+
+function resolveFfmpegExecutableOrThrow() {
+  const configured = resolveConfiguredFfmpegExecutable();
+  if (ffmpegExecutableCache && ffmpegExecutableCacheKey === configured) {
+    return ffmpegExecutableCache;
+  }
+
+  try {
+    const resolved = probeFfmpegExecutable(configured);
+    ffmpegExecutableCache = resolved;
+    ffmpegExecutableCacheKey = configured;
+    return resolved;
+  } catch (err) {
+    const hint = configured === "ffmpeg"
+      ? "Install ffmpeg or set PLAUD_FFMPEG_PATH."
+      : "Check PLAUD_FFMPEG_PATH.";
+    const msg = err?.message || String(err);
+    throw new Error(`ffmpeg not found or unavailable (${configured}): ${msg}. ${hint}`);
+  }
+}
+
+async function convertAudioBufferToWavWithFfmpeg(buffer, options = {}) {
+  if (!Buffer.isBuffer(buffer) || !buffer.length) {
+    throw new Error("Missing audio buffer for WAV conversion.");
+  }
+
+  const ffmpegExecutable = resolveFfmpegExecutableOrThrow();
+  const maxBytes = clampInteger(options?.maxBytes, {
+    defaultValue: 500 * 1024 * 1024,
+    min: 1,
+    max: 1_000_000_000,
+  });
+  const fileId = String(options?.fileId || "").trim();
+  const stem = sanitizeFileNameSegment(fileId || "plaud-audio", "plaud-audio");
+  const workDir = mkdtempSync(join(tmpdir(), "plaud-mcp-audio-"));
+  const inputPath = join(workDir, `${stem}.input`);
+  const outputPath = join(workDir, `${stem}.wav`);
+
+  try {
+    writeFileSync(inputPath, buffer, { mode: 0o600 });
+    const args = [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-y",
+      "-i",
+      inputPath,
+      "-vn",
+      "-acodec",
+      "pcm_s16le",
+      outputPath,
+    ];
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn(ffmpegExecutable, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      const stdoutChunks = [];
+      const stderrChunks = [];
+
+      child.stdout?.on("data", (chunk) => {
+        stdoutChunks.push(chunk);
+      });
+      child.stderr?.on("data", (chunk) => {
+        stderrChunks.push(chunk);
+      });
+      child.on("error", (err) => {
+        reject(err);
+      });
+      child.on("close", (code) => {
+        resolve({
+          status: Number.isFinite(code) ? Number(code) : -1,
+          stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+          stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        });
+      });
+    });
+
+    if (result.status !== 0) {
+      const detail = String(result.stderr || result.stdout || "").trim();
+      throw new Error(detail || `exit code ${result.status}`);
+    }
+    if (!existsSync(outputPath)) {
+      throw new Error("Output file not found.");
+    }
+    const converted = readFileSync(outputPath);
+    if (converted.length > maxBytes) {
+      throw new Error(`Converted WAV exceeds max_bytes (${converted.length} > ${maxBytes}).`);
+    }
+    return {
+      buffer: converted,
+      contentType: "audio/wav",
+      ffmpegExecutable,
+    };
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
 }
 
 function toAppleScriptString(value) {
@@ -2988,12 +3161,13 @@ async function handleGetFileData(args) {
   return result;
 }
 
-async function loadSingleFileAudioPayload(client, fileId, options = {}) {
+async function loadSingleFileAudioPayloadCore(client, fileId, options = {}) {
   const shouldDownload = toBoolean(options?.shouldDownload, false);
   const saveToFile = String(options?.saveToFile || "").trim();
   const saveToDir = String(options?.saveToDir || "").trim();
   const returnBase64 = toBoolean(options?.returnBase64, false);
   const includeDataUrl = returnBase64 && toBoolean(options?.includeDataUrl, false);
+  const audioFormat = normalizeAudioFormat(options?.audioFormat);
   const defaultMaxBytes = returnBase64 ? 20 * 1024 * 1024 : 500 * 1024 * 1024;
   const maxBytes = clampInteger(options?.maxBytes, {
     defaultValue: defaultMaxBytes,
@@ -3008,6 +3182,7 @@ async function loadSingleFileAudioPayload(client, fileId, options = {}) {
     request_url: tempUrlResp.requestUrl,
     temp_url: tempUrlResp.tempUrl,
     download_performed: shouldDownload,
+    audio_format_requested: audioFormat,
   };
 
   if (!shouldDownload) {
@@ -3015,24 +3190,47 @@ async function loadSingleFileAudioPayload(client, fileId, options = {}) {
   }
 
   const downloaded = await fetchBinaryFromUrl(tempUrlResp.tempUrl, { maxBytes });
+  let outputBuffer = downloaded.buffer;
+  let outputContentType = downloaded.contentType;
+  let outputSize = downloaded.size;
+  let audioFormatApplied = AUDIO_FORMAT_ORIGINAL;
+  let ffmpegExecutable = "";
+
+  if (audioFormat === AUDIO_FORMAT_WAV) {
+    const converted = await convertAudioBufferToWavWithFfmpeg(downloaded.buffer, {
+      fileId,
+      maxBytes,
+    });
+    outputBuffer = converted.buffer;
+    outputContentType = converted.contentType;
+    outputSize = converted.buffer.length;
+    audioFormatApplied = AUDIO_FORMAT_WAV;
+    ffmpegExecutable = converted.ffmpegExecutable;
+  }
+
   const audio = {
     final_url: downloaded.requestUrl,
-    content_type: downloaded.contentType,
-    size: downloaded.size,
+    content_type: outputContentType,
+    size: outputSize,
+    source_content_type: downloaded.contentType,
+    source_size: downloaded.size,
     max_bytes: maxBytes,
     saved_to_file: "",
     returned_base64: returnBase64,
+    audio_format_applied: audioFormatApplied,
   };
+  if (ffmpegExecutable) audio.ffmpeg_executable = ffmpegExecutable;
 
   const outputPath = buildAudioOutputFilePath({
     saveToFile,
     saveToDir,
     fileId,
-    contentType: downloaded.contentType,
+    contentType: outputContentType,
     downloadUrl: downloaded.requestUrl || tempUrlResp.tempUrl,
+    forcedExtension: audioFormatApplied === AUDIO_FORMAT_WAV ? "wav" : "",
   });
   if (outputPath) {
-    const persisted = persistBinaryToFile(downloaded.buffer, outputPath);
+    const persisted = persistBinaryToFile(outputBuffer, outputPath);
     if (!persisted.ok) {
       throw new Error(`Failed to save audio file: ${persisted.error}`);
     }
@@ -3040,16 +3238,101 @@ async function loadSingleFileAudioPayload(client, fileId, options = {}) {
   }
 
   if (returnBase64) {
-    const base64 = downloaded.buffer.toString("base64");
+    const base64 = outputBuffer.toString("base64");
     audio.base64 = base64;
     if (includeDataUrl) {
-      const mimeType = downloaded.contentType || "application/octet-stream";
+      const mimeType = outputContentType || "application/octet-stream";
       audio.data_url = `data:${mimeType};base64,${base64}`;
     }
   }
 
+  result.audio_format_applied = audioFormatApplied;
   result.audio = audio;
   return result;
+}
+
+const audioPayloadInFlight = new Map();
+const audioPayloadResultCache = new Map();
+
+function buildAudioPayloadExecutionKey(client, fileId, options = {}) {
+  const normalized = {
+    api_origin: String(client?.apiOrigin || "").trim().toLowerCase(),
+    file_id: String(fileId || "").trim(),
+    should_download: toBoolean(options?.shouldDownload, false),
+    save_to_file: String(options?.saveToFile || "").trim(),
+    save_to_dir: String(options?.saveToDir || "").trim(),
+    return_base64: toBoolean(options?.returnBase64, false),
+    include_data_url: toBoolean(options?.includeDataUrl, false),
+    max_bytes: clampInteger(options?.maxBytes, {
+      defaultValue: 500 * 1024 * 1024,
+      min: 1,
+      max: 1_000_000_000,
+    }),
+    audio_format: normalizeAudioFormat(options?.audioFormat),
+  };
+  return createHash("sha1").update(JSON.stringify(normalized)).digest("hex");
+}
+
+function cloneAudioPayloadResult(value) {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return value;
+  }
+}
+
+function pruneAudioPayloadResultCache() {
+  const now = Date.now();
+  for (const [key, entry] of audioPayloadResultCache.entries()) {
+    if (!entry || now >= Number(entry.expiresAt || 0)) {
+      audioPayloadResultCache.delete(key);
+    }
+  }
+  if (audioPayloadResultCache.size <= AUDIO_RESULT_CACHE_MAX_ENTRIES) return;
+  const items = Array.from(audioPayloadResultCache.entries()).sort(
+    (a, b) => Number(a?.[1]?.expiresAt || 0) - Number(b?.[1]?.expiresAt || 0)
+  );
+  while (audioPayloadResultCache.size > AUDIO_RESULT_CACHE_MAX_ENTRIES && items.length) {
+    const [key] = items.shift();
+    audioPayloadResultCache.delete(key);
+  }
+}
+
+function shouldCacheAudioPayloadResult(result) {
+  return !result?.audio?.base64;
+}
+
+async function loadSingleFileAudioPayload(client, fileId, options = {}) {
+  const key = buildAudioPayloadExecutionKey(client, fileId, options);
+  pruneAudioPayloadResultCache();
+
+  const cached = audioPayloadResultCache.get(key);
+  if (cached && Date.now() < Number(cached.expiresAt || 0)) {
+    return cloneAudioPayloadResult(cached.result);
+  }
+
+  if (audioPayloadInFlight.has(key)) {
+    return audioPayloadInFlight.get(key);
+  }
+
+  const taskPromise = loadSingleFileAudioPayloadCore(client, fileId, options)
+    .then((result) => {
+      if (shouldCacheAudioPayloadResult(result)) {
+        audioPayloadResultCache.set(key, {
+          expiresAt: Date.now() + AUDIO_RESULT_CACHE_TTL_MS,
+          result: cloneAudioPayloadResult(result),
+        });
+      }
+      return result;
+    })
+    .finally(() => {
+      if (audioPayloadInFlight.get(key) === taskPromise) {
+        audioPayloadInFlight.delete(key);
+      }
+    });
+
+  audioPayloadInFlight.set(key, taskPromise);
+  return taskPromise;
 }
 
 async function handleGetFileAudio(args) {
@@ -3066,6 +3349,7 @@ async function handleGetFileAudio(args) {
 
   const returnBase64 = toBoolean(args?.return_base64, false);
   const includeDataUrl = returnBase64 && toBoolean(args?.include_data_url, false);
+  const audioFormat = normalizeAudioFormat(pickNonEmptyString(args?.audio_format, args?.audioFormat));
   const explicitDownload = toBoolean(args?.download, false);
   const shouldDownload = explicitDownload || Boolean(saveToFile) || Boolean(saveToDir) || returnBase64;
   const defaultMaxBytes = returnBase64 ? 20 * 1024 * 1024 : 500 * 1024 * 1024;
@@ -3093,6 +3377,7 @@ async function handleGetFileAudio(args) {
       saveToDir,
       returnBase64,
       includeDataUrl,
+      audioFormat,
       maxBytes,
     });
   }
@@ -3104,7 +3389,9 @@ async function handleGetFileAudio(args) {
       request_url: item.request_url,
       temp_url: item.temp_url,
       download_performed: item.download_performed,
+      audio_format_requested: item.audio_format_requested,
     };
+    if (item.audio_format_applied) out.audio_format_applied = item.audio_format_applied;
     if (item.audio) out.audio = item.audio;
     return out;
   };
@@ -3118,6 +3405,7 @@ async function handleGetFileAudio(args) {
           saveToDir,
           returnBase64,
           includeDataUrl,
+          audioFormat,
           maxBytes,
         });
         results.push(normalizeBatchItem(item));
@@ -3134,6 +3422,7 @@ async function handleGetFileAudio(args) {
           saveToDir,
           returnBase64,
           includeDataUrl,
+          audioFormat,
           maxBytes,
         });
         return normalizeBatchItem(item);
@@ -3141,6 +3430,7 @@ async function handleGetFileAudio(args) {
         return {
           ok: false,
           file_id: fileId,
+          audio_format_requested: audioFormat,
           error: err?.message || String(err),
         };
       }
@@ -3156,6 +3446,7 @@ async function handleGetFileAudio(args) {
     success,
     failed,
     download_performed: shouldDownload,
+    audio_format_requested: audioFormat,
     return_base64: returnBase64,
     save_to_dir: saveToDir,
     max_bytes: maxBytes,
@@ -3220,11 +3511,52 @@ function sendError(id, code, message, data) {
   });
 }
 
+function sendNotification(method, params) {
+  sendMessage({
+    jsonrpc: "2.0",
+    method: String(method || "").trim() || "notifications/message",
+    params: params && typeof params === "object" ? params : {},
+  });
+}
+
+function sendProgressNotification(progressToken, detail = "", progress = 0) {
+  if (progressToken === undefined || progressToken === null || progressToken === "") return;
+  sendNotification("notifications/progress", {
+    progressToken,
+    progress,
+    message: String(detail || "").trim(),
+  });
+}
+
 function logError(message, error) {
   const line = String(message || "").trim();
   const detail = error?.stack || error?.message || (error ? String(error) : "");
   const text = detail ? `${line}\n${detail}\n` : `${line}\n`;
   process.stderr.write(text);
+}
+
+function startToolHeartbeat({ requestId, toolName, progressToken }) {
+  const name = String(toolName || "tool").trim() || "tool";
+  const idText = String(requestId ?? "").trim();
+  const label = idText ? `${name}#${idText}` : name;
+  let tick = 0;
+
+  const emit = (phase) => {
+    tick += 1;
+    const detail = `still running (${phase}), tick=${tick}`;
+    process.stderr.write(`[${SERVER_NAME}] ${label} ${detail}\n`);
+    sendProgressNotification(progressToken, `${name} ${detail}`, tick);
+  };
+
+  emit("start");
+  const timer = setInterval(() => emit("heartbeat"), TOOL_HEARTBEAT_INTERVAL_MS);
+
+  return {
+    stop(status = "done") {
+      clearInterval(timer);
+      emit(status);
+    },
+  };
 }
 
 async function handleRequest(message) {
@@ -3268,15 +3600,34 @@ async function handleRequest(message) {
 
   if (method === "tools/call") {
     const toolName = String(params?.name || "").trim();
-    const toolArgs = params?.arguments && typeof params.arguments === "object"
+    const rawToolArgs = params?.arguments && typeof params.arguments === "object"
       ? params.arguments
       : {};
+    const progressToken =
+      params?._meta?.progressToken ?? params?.meta?.progressToken ?? params?.progressToken;
+    const toolArgs = {
+      ...rawToolArgs,
+      __mcpRequestMeta: {
+        requestId: id,
+        progressToken,
+      },
+    };
+    const heartbeat =
+      toolName === TOOL_GET_FILE_AUDIO
+        ? startToolHeartbeat({
+            requestId: id,
+            toolName: toolName || "tools/call",
+            progressToken,
+          })
+        : null;
 
     try {
       const payload = await executeToolCall(toolName, toolArgs);
       sendResponse(id, buildToolTextResult(payload));
     } catch (err) {
       sendResponse(id, buildToolErrorResult(err));
+    } finally {
+      if (heartbeat) heartbeat.stop("end");
     }
     return;
   }

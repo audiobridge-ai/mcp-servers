@@ -118,6 +118,14 @@ Download and save to local file:
 Call MCP tool plaud_get_file_audio with arguments {"file_id":"<YOUR_FILE_ID>","download":true,"save_to_file":"/absolute/path/plaud-audio.mp3"}.
 ```
 
+Download, convert, and save as wav:
+
+```text
+Call MCP tool plaud_get_file_audio with arguments {"file_id":"<YOUR_FILE_ID>","download":true,"audio_format":"wav","save_to_file":"/absolute/path/plaud-audio.wav"}.
+```
+
+Note: `audio_format=wav` needs ffmpeg available in PATH, or set `PLAUD_FFMPEG_PATH`.
+
 Batch download and save into one directory:
 
 ```text
