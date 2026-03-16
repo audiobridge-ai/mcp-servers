@@ -1,7 +1,7 @@
 # PLAUD MCP User Guide
 
 This guide is for end users.  
-It explains how to use this MCP in Claude Code or Codex to access PLAUD files, transcripts, summaries, and audio.
+It explains how to use this MCP in Claude Code or Codex to access and update PLAUD files, transcripts, summaries, and audio.
 
 ## What You Get
 
@@ -15,6 +15,8 @@ After setup, Claude Code or Codex can use these MCP tools:
   - Fetches file detail, transcript, and summary for a specific file.
 - `plaud_get_file_audio`
   - Fetches audio `temp_url` for a `file_id`, and can optionally download/save/return base64 audio.
+- `plaud_upload_transcript_file`
+  - Uploads a transcript back into a PLAUD file from a local file, inline text, or structured JSON.
 
 ## Prerequisites
 
@@ -130,6 +132,39 @@ Batch download and save into one directory:
 
 ```text
 Call MCP tool plaud_get_file_audio with arguments {"file_ids":["<FILE_ID_1>","<FILE_ID_2>"],"download":true,"save_to_dir":"/absolute/path/plaud-audios","download_concurrency":3,"continue_on_error":true}.
+```
+
+5. Upload a transcript file back to PLAUD
+
+Upload local subtitle/transcript file:
+
+```text
+Call MCP tool plaud_upload_transcript_file with arguments {"file_id":"<YOUR_FILE_ID>","file_path":"/absolute/path/transcript.srt"}.
+```
+
+Upload local timestamped Markdown/TXT:
+
+```text
+Call MCP tool plaud_upload_transcript_file with arguments {"file_id":"<YOUR_FILE_ID>","file_path":"/absolute/path/transcript.md","input_format":"auto"}.
+```
+
+Supported timestamped text example:
+
+```text
+[00:00:12] Speaker 1: Hello
+[00:00:16] Speaker 2: Hi
+```
+
+Upload inline plain text:
+
+```text
+Call MCP tool plaud_upload_transcript_file with arguments {"file_id":"<YOUR_FILE_ID>","transcript_text":"This is a manually prepared transcript.","input_format":"plain_text"}.
+```
+
+Upload structured JSON:
+
+```text
+Call MCP tool plaud_upload_transcript_file with arguments {"file_id":"<YOUR_FILE_ID>","transcript_data":[{"content":"Hello","speaker":"Speaker 1","start_time":0,"end_time":1200}]}.
 ```
 
 ## Optional: Use Token Directly (No Browser Auth)

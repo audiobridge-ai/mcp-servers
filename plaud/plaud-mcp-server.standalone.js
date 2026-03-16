@@ -7,7 +7,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, extname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { gunzipSync } from "node:zlib";
 
@@ -497,7 +497,7 @@ const { normalizeTranscriptionToTransResult } = (() => {
 })();
 
 const SERVER_NAME = "plaud-local-mcp";
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "0.2.0";
 const DEFAULT_PROTOCOL_VERSION = "2024-11-05";
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2024-11-05", "2024-10-07"]);
 const DEFAULT_API_ORIGIN = "https://api.plaud.ai";
@@ -509,6 +509,7 @@ const API_ORIGIN_STATE_FILE_SUFFIX = ".api-origins.json";
 const TOOL_LIST_FILES = "plaud_list_files";
 const TOOL_GET_FILE_DATA = "plaud_get_file_data";
 const TOOL_GET_FILE_AUDIO = "plaud_get_file_audio";
+const TOOL_UPLOAD_TRANSCRIPT_FILE = "plaud_upload_transcript_file";
 const TOOL_AUTH_BROWSER = "plaud_auth_browser";
 const AUDIO_FORMAT_ORIGINAL = "original";
 const AUDIO_FORMAT_WAV = "wav";
@@ -520,12 +521,23 @@ const TRANSCRIPT_FORMAT_SRT = "srt";
 const TRANSCRIPT_FORMAT_VTT = "vtt";
 const TRANSCRIPT_FORMAT_TEXT = "text";
 const TRANSCRIPT_FORMAT_TEXT_TIMESTAMPED = "text_timestamped";
+const TRANSCRIPT_UPLOAD_FORMAT_AUTO = "auto";
+const TRANSCRIPT_UPLOAD_FORMAT_PLAIN_TEXT = "plain_text";
 const TRANSCRIPT_FORMAT_SET = new Set([
   TRANSCRIPT_FORMAT_JSON,
   TRANSCRIPT_FORMAT_SRT,
   TRANSCRIPT_FORMAT_VTT,
   TRANSCRIPT_FORMAT_TEXT,
   TRANSCRIPT_FORMAT_TEXT_TIMESTAMPED,
+]);
+const TRANSCRIPT_UPLOAD_FORMAT_SET = new Set([
+  TRANSCRIPT_UPLOAD_FORMAT_AUTO,
+  TRANSCRIPT_FORMAT_JSON,
+  TRANSCRIPT_FORMAT_SRT,
+  TRANSCRIPT_FORMAT_VTT,
+  TRANSCRIPT_FORMAT_TEXT,
+  TRANSCRIPT_FORMAT_TEXT_TIMESTAMPED,
+  TRANSCRIPT_UPLOAD_FORMAT_PLAIN_TEXT,
 ]);
 
 const TOOLS = [
@@ -702,6 +714,66 @@ const TOOLS = [
           description: "When batch mode fails for one file, continue remaining files.",
         },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: TOOL_UPLOAD_TRANSCRIPT_FILE,
+    description:
+      "Upload transcript content to a PLAUD file from a local file, inline text, or structured transcript data.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_id: {
+          type: "string",
+          description: "PLAUD file id.",
+        },
+        file_path: {
+          type: "string",
+          description:
+            "Local transcript file path. Supported auto-detected types include .json, .srt, .vtt, .txt, .md.",
+        },
+        transcript_text: {
+          type: "string",
+          description:
+            "Inline transcript text. Can be JSON, SRT, VTT, timestamped text, or plain text depending on input_format.",
+        },
+        transcript_data: {
+          description:
+            "Structured transcript payload. Can be an array of segments or an object with trans_result/segments/utterances/words/text.",
+        },
+        input_format: {
+          type: "string",
+          enum: [
+            TRANSCRIPT_UPLOAD_FORMAT_AUTO,
+            TRANSCRIPT_FORMAT_JSON,
+            TRANSCRIPT_FORMAT_SRT,
+            TRANSCRIPT_FORMAT_VTT,
+            TRANSCRIPT_FORMAT_TEXT,
+            TRANSCRIPT_FORMAT_TEXT_TIMESTAMPED,
+            TRANSCRIPT_UPLOAD_FORMAT_PLAIN_TEXT,
+          ],
+          default: TRANSCRIPT_UPLOAD_FORMAT_AUTO,
+          description:
+            "How to parse transcript input: auto/json/srt/vtt/text_timestamped/text/plain_text.",
+        },
+        filename: {
+          type: "string",
+          description:
+            "Optional filename hint when using transcript_text, used for auto format detection.",
+        },
+        default_speaker: {
+          type: "string",
+          default: "Speaker 1",
+          description: "Fallback speaker label when source data does not include one.",
+        },
+        include_transcript_segments: {
+          type: "boolean",
+          default: false,
+          description: "Include parsed transcript segments in the response.",
+        },
+      },
+      required: ["file_id"],
       additionalProperties: false,
     },
   },
@@ -2208,6 +2280,466 @@ function normalizeTranscriptFormat(value) {
   );
 }
 
+function normalizeTranscriptUploadFormat(value) {
+  const raw = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!raw) return TRANSCRIPT_UPLOAD_FORMAT_AUTO;
+  if (raw === "txt" || raw === "markdown" || raw === "md") {
+    return TRANSCRIPT_FORMAT_TEXT_TIMESTAMPED;
+  }
+  if (raw === "plain" || raw === "plain-text" || raw === "plaintext") {
+    return TRANSCRIPT_UPLOAD_FORMAT_PLAIN_TEXT;
+  }
+  if (raw === TRANSCRIPT_FORMAT_TEXT) {
+    return TRANSCRIPT_UPLOAD_FORMAT_PLAIN_TEXT;
+  }
+  if (TRANSCRIPT_UPLOAD_FORMAT_SET.has(raw)) return raw;
+  throw new Error(
+    `Invalid input_format: ${value}. Supported values: ${Array.from(TRANSCRIPT_UPLOAD_FORMAT_SET).join(", ")}`
+  );
+}
+
+function normalizeTranscriptInputText(value) {
+  return String(value || "")
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n?/g, "\n");
+}
+
+function normalizeDefaultSpeaker(value) {
+  return pickNonEmptyString(value) || "Speaker 1";
+}
+
+function parseFlexibleTimestampToMs(value) {
+  const raw = String(value || "")
+    .trim()
+    .replace(",", ".");
+  if (!raw) return Number.NaN;
+
+  const parts = raw.split(":");
+  if (parts.length < 2 || parts.length > 3) return Number.NaN;
+
+  const seconds = Number(parts[parts.length - 1]);
+  const minutes = Number(parts[parts.length - 2]);
+  const hours = parts.length === 3 ? Number(parts[0]) : 0;
+  if (
+    !Number.isFinite(seconds) ||
+    !Number.isFinite(minutes) ||
+    !Number.isFinite(hours) ||
+    seconds < 0 ||
+    minutes < 0 ||
+    hours < 0
+  ) {
+    return Number.NaN;
+  }
+
+  return Math.round((hours * 3600 + minutes * 60 + seconds) * 1000);
+}
+
+function normalizeParsedTranscriptSegmentText(lines) {
+  const list = Array.isArray(lines) ? lines : [];
+  return list
+    .map((line) => String(line || "").trim())
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function finalizeTranscriptSegments(segments, options = {}) {
+  const defaultSpeaker = normalizeDefaultSpeaker(options?.defaultSpeaker);
+  const list = Array.isArray(segments) ? segments : [];
+  const out = [];
+
+  for (const item of list) {
+    const content = String(item?.content ?? item?.text ?? "").trim();
+    if (!content) continue;
+
+    const startMs = Number(item?.start_time ?? item?.startTime ?? 0);
+    const endMs = Number(item?.end_time ?? item?.endTime ?? 0);
+    out.push({
+      content,
+      start_time:
+        Number.isFinite(startMs) && startMs >= 0 ? Math.round(startMs) : 0,
+      end_time: Number.isFinite(endMs) && endMs >= 0 ? Math.round(endMs) : 0,
+      speaker: pickNonEmptyString(
+        item?.speaker,
+        item?.speaker_label,
+        item?.speakerLabel
+      ) || defaultSpeaker,
+      embeddingKey: null,
+    });
+  }
+
+  for (let index = 0; index < out.length; index += 1) {
+    const segment = out[index];
+    if (!segment) continue;
+    if (segment.end_time > segment.start_time) continue;
+
+    const next = out[index + 1];
+    if (next && next.start_time > segment.start_time) {
+      segment.end_time = next.start_time;
+      continue;
+    }
+
+    const prev = out[index - 1];
+    const fallbackDuration = prev
+      ? Math.max(1000, Number(prev.end_time || 0) - Number(prev.start_time || 0))
+      : 1000;
+    segment.end_time = segment.start_time + fallbackDuration;
+  }
+
+  return out;
+}
+
+function getTranscriptUploadFileExtension(filePath, filename = "") {
+  const hint = pickNonEmptyString(filename, filePath);
+  return String(extname(hint || "") || "").trim().toLowerCase();
+}
+
+function matchTimestampedTextLine(line) {
+  return String(line || "").trim().match(
+    /^(?:[-*+]\s+|\d+\.\s+)?(?:\[(\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?)\]|(\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?))\s*(?:[-–—]\s*)?(?:(.+?)\s*[:：]\s*)?(.*)$/u
+  );
+}
+
+function looksLikeTimestampedText(source) {
+  const lines = normalizeTranscriptInputText(source).split("\n");
+  return lines.some((line) => {
+    const match = matchTimestampedTextLine(line);
+    const timestamp = match?.[1] || match?.[2] || "";
+    return Number.isFinite(parseFlexibleTimestampToMs(timestamp));
+  });
+}
+
+function parseTimestampedTextTranscript(source, options = {}) {
+  const defaultSpeaker = normalizeDefaultSpeaker(options?.defaultSpeaker);
+  const text = normalizeTranscriptInputText(source);
+  if (!text.trim()) {
+    throw new Error("Transcript input is empty");
+  }
+
+  const lines = text.split("\n");
+  const out = [];
+  let current = null;
+  let headerCount = 0;
+
+  const flushCurrent = (nextStartMs = null) => {
+    if (!current) return;
+    const content = normalizeParsedTranscriptSegmentText(current.lines);
+    if (!content) {
+      current = null;
+      return;
+    }
+
+    const startMs = Math.max(0, Math.round(Number(current.startMs) || 0));
+    let endMs = startMs;
+    if (Number.isFinite(nextStartMs)) {
+      const normalizedNext = Math.max(0, Math.round(nextStartMs));
+      if (normalizedNext >= startMs) endMs = normalizedNext;
+    }
+
+    out.push({
+      content,
+      start_time: startMs,
+      end_time: endMs,
+      speaker: pickNonEmptyString(current.speaker) || defaultSpeaker,
+      embeddingKey: null,
+    });
+    current = null;
+  };
+
+  for (const rawLine of lines) {
+    const trimmed = String(rawLine || "").trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith("```")) continue;
+
+    const line = trimmed
+      .replace(/^>\s*/, "")
+      .replace(/^(?:[-*+]\s+|\d+\.\s+)/, "");
+    const headerMatch = matchTimestampedTextLine(line);
+    const timeRaw = headerMatch?.[1] || headerMatch?.[2] || "";
+
+    if (headerMatch && timeRaw) {
+      const nextStartMs = parseFlexibleTimestampToMs(timeRaw);
+      if (Number.isFinite(nextStartMs)) {
+        headerCount += 1;
+        flushCurrent(nextStartMs);
+        current = {
+          startMs: nextStartMs,
+          speaker: String(headerMatch[3] || "").trim(),
+          lines: [],
+        };
+        const firstText = String(headerMatch[4] || "").trim();
+        if (firstText) current.lines.push(firstText);
+        continue;
+      }
+    }
+
+    if (!current) continue;
+    current.lines.push(line);
+  }
+
+  flushCurrent();
+
+  if (!headerCount) {
+    throw new Error(
+      "Unrecognized timestamped transcript format. Example: [00:00:12] Speaker 1: Hello"
+    );
+  }
+  if (!out.length) {
+    throw new Error("No transcript content could be parsed from timestamped text");
+  }
+
+  return finalizeTranscriptSegments(out, { defaultSpeaker });
+}
+
+function parseSubtitleTimingLine(line) {
+  const parts = String(line || "").split(/\s+-->\s+/);
+  if (parts.length < 2) return null;
+
+  const startRaw = String(parts[0] || "").trim();
+  const endRaw = String(parts[1] || "")
+    .trim()
+    .split(/\s+/)[0];
+  const startMs = parseFlexibleTimestampToMs(startRaw);
+  const endMs = parseFlexibleTimestampToMs(endRaw);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return null;
+  return { startMs, endMs };
+}
+
+function looksLikeSubtitleTranscript(source) {
+  const lines = normalizeTranscriptInputText(source).split("\n");
+  return lines.some((line) => parseSubtitleTimingLine(line));
+}
+
+function decodeBasicHtmlEntities(text) {
+  return String(text || "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#39;/gi, "'");
+}
+
+function extractSpeakerFromCueText(text, defaultSpeaker) {
+  let raw = String(text || "").trim();
+  let speaker = "";
+
+  const voiceMatch = raw.match(/^<v(?:\.[^ >]+)?\s+([^>]+)>([\s\S]*)$/i);
+  if (voiceMatch?.[1]) {
+    speaker = String(voiceMatch[1] || "").trim();
+    raw = String(voiceMatch[2] || "").trim();
+  }
+
+  raw = decodeBasicHtmlEntities(raw.replace(/<br\s*\/?>/gi, "\n"));
+  raw = raw.replace(/<\/?[^>]+>/g, " ");
+  raw = raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!speaker) {
+    const match = raw.match(/^([\p{L}\p{N}_ .-]{1,40})\s*[:：]\s*(.+)$/u);
+    if (match?.[1] && match?.[2]) {
+      speaker = String(match[1] || "").trim();
+      raw = String(match[2] || "").trim();
+    }
+  }
+
+  return {
+    speaker: speaker || normalizeDefaultSpeaker(defaultSpeaker),
+    content: raw,
+  };
+}
+
+function parseSubtitleTranscript(source, options = {}) {
+  const defaultSpeaker = normalizeDefaultSpeaker(options?.defaultSpeaker);
+  const text = normalizeTranscriptInputText(source);
+  if (!text.trim()) {
+    throw new Error("Transcript input is empty");
+  }
+
+  const blocks = text.split(/\n{2,}/);
+  const out = [];
+
+  for (const block of blocks) {
+    const lines = String(block || "")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (!lines.length) continue;
+
+    const timingIndex = lines.findIndex((line) => line.includes("-->"));
+    if (timingIndex < 0) continue;
+
+    const timing = parseSubtitleTimingLine(lines[timingIndex]);
+    if (!timing) continue;
+
+    const cueText = lines.slice(timingIndex + 1).join("\n").trim();
+    if (!cueText) continue;
+
+    const normalizedCue = extractSpeakerFromCueText(cueText, defaultSpeaker);
+    if (!normalizedCue.content) continue;
+
+    out.push({
+      content: normalizedCue.content,
+      start_time: timing.startMs,
+      end_time: timing.endMs,
+      speaker: normalizedCue.speaker,
+      embeddingKey: null,
+    });
+  }
+
+  if (!out.length) {
+    throw new Error("No subtitle cues could be parsed from transcript input");
+  }
+
+  return finalizeTranscriptSegments(out, { defaultSpeaker });
+}
+
+function parseJsonTranscript(input, options = {}) {
+  let payload = input;
+  if (typeof payload === "string") {
+    const trimmed = String(payload || "").trim();
+    if (!trimmed) throw new Error("Transcript JSON input is empty");
+    const parsed = safeJsonParse(trimmed);
+    if (parsed == null) throw new Error("Invalid JSON transcript input");
+    payload = parsed;
+  }
+
+  const normalized = normalizeTranscriptionToTransResult(payload);
+  if (!normalized.length) {
+    throw new Error("No transcript segments found in JSON input");
+  }
+  return finalizeTranscriptSegments(normalized, {
+    defaultSpeaker: options?.defaultSpeaker,
+  });
+}
+
+function parsePlainTextTranscript(source, options = {}) {
+  const text = normalizeTranscriptInputText(source).trim();
+  if (!text) throw new Error("Transcript input is empty");
+  const normalized = normalizeTranscriptionToTransResult({ text });
+  if (!normalized.length) {
+    throw new Error("No transcript content could be parsed from plain text");
+  }
+  return finalizeTranscriptSegments(normalized, {
+    defaultSpeaker: options?.defaultSpeaker,
+  });
+}
+
+function inferTranscriptUploadFormat({ filePath = "", filename = "", transcriptText = "", transcriptData } = {}) {
+  if (transcriptData !== undefined) return TRANSCRIPT_FORMAT_JSON;
+
+  const source = normalizeTranscriptInputText(transcriptText);
+  const extension = getTranscriptUploadFileExtension(filePath, filename);
+
+  if (extension === ".json") return TRANSCRIPT_FORMAT_JSON;
+  if (extension === ".srt") return TRANSCRIPT_FORMAT_SRT;
+  if (extension === ".vtt") return TRANSCRIPT_FORMAT_VTT;
+  if (extension === ".lrc") return TRANSCRIPT_FORMAT_TEXT_TIMESTAMPED;
+
+  const trimmed = source.trim();
+  if (!trimmed) return TRANSCRIPT_UPLOAD_FORMAT_PLAIN_TEXT;
+  if (safeJsonParse(trimmed) != null) return TRANSCRIPT_FORMAT_JSON;
+  if (/^WEBVTT\b/im.test(trimmed)) return TRANSCRIPT_FORMAT_VTT;
+  if (looksLikeSubtitleTranscript(trimmed)) {
+    return extension === ".vtt" ? TRANSCRIPT_FORMAT_VTT : TRANSCRIPT_FORMAT_SRT;
+  }
+  if (looksLikeTimestampedText(trimmed)) return TRANSCRIPT_FORMAT_TEXT_TIMESTAMPED;
+  return TRANSCRIPT_UPLOAD_FORMAT_PLAIN_TEXT;
+}
+
+function parseTranscriptUploadInput(args = {}) {
+  const filePath = String(args?.file_path || "").trim();
+  const transcriptTextInput = args?.transcript_text;
+  const hasTranscriptText = typeof transcriptTextInput === "string";
+  const hasTranscriptData = args?.transcript_data !== undefined;
+  const includeSegments = toBoolean(args?.include_transcript_segments, false);
+  const defaultSpeaker = normalizeDefaultSpeaker(args?.default_speaker);
+  const requestedFormat = normalizeTranscriptUploadFormat(args?.input_format);
+  const filenameHint = String(args?.filename || "").trim();
+
+  const sources = [Boolean(filePath), hasTranscriptText, hasTranscriptData].filter(Boolean).length;
+  if (sources === 0) {
+    throw new Error("Provide one of file_path, transcript_text, or transcript_data");
+  }
+  if (sources > 1) {
+    throw new Error("Only one of file_path, transcript_text, or transcript_data can be used");
+  }
+
+  let transcriptText = "";
+  let sourceType = "inline_text";
+  let sourceLabel = "";
+  let transcriptData = args?.transcript_data;
+
+  if (filePath) {
+    if (!existsSync(filePath)) {
+      throw new Error(`Transcript file not found: ${filePath}`);
+    }
+    transcriptText = readFileSync(filePath, "utf8");
+    sourceType = "file_path";
+    sourceLabel = filePath;
+  } else if (hasTranscriptText) {
+    transcriptText = String(transcriptTextInput || "");
+    sourceType = "transcript_text";
+    sourceLabel = filenameHint;
+  } else {
+    sourceType = "transcript_data";
+    sourceLabel = filenameHint;
+  }
+
+  if (
+    hasTranscriptData &&
+    requestedFormat !== TRANSCRIPT_UPLOAD_FORMAT_AUTO &&
+    requestedFormat !== TRANSCRIPT_FORMAT_JSON
+  ) {
+    throw new Error("transcript_data only supports input_format=auto or json");
+  }
+
+  const detectedFormat =
+    requestedFormat === TRANSCRIPT_UPLOAD_FORMAT_AUTO
+      ? inferTranscriptUploadFormat({
+          filePath,
+          filename: filenameHint,
+          transcriptText,
+          transcriptData,
+        })
+      : requestedFormat;
+
+  let transResult = [];
+  if (detectedFormat === TRANSCRIPT_FORMAT_JSON) {
+    transResult = parseJsonTranscript(
+      hasTranscriptData ? transcriptData : transcriptText,
+      { defaultSpeaker }
+    );
+  } else if (
+    detectedFormat === TRANSCRIPT_FORMAT_SRT ||
+    detectedFormat === TRANSCRIPT_FORMAT_VTT
+  ) {
+    transResult = parseSubtitleTranscript(transcriptText, { defaultSpeaker });
+  } else if (detectedFormat === TRANSCRIPT_FORMAT_TEXT_TIMESTAMPED) {
+    transResult = parseTimestampedTextTranscript(transcriptText, { defaultSpeaker });
+  } else {
+    transResult = parsePlainTextTranscript(transcriptText, { defaultSpeaker });
+  }
+
+  return {
+    sourceType,
+    sourceLabel,
+    requestedFormat,
+    detectedFormat,
+    defaultSpeaker,
+    includeSegments,
+    transResult,
+  };
+}
+
 function toNonNegativeInteger(value, fallback = 0) {
   const n = Number(value);
   if (!Number.isFinite(n) || n < 0) return fallback;
@@ -2317,6 +2849,79 @@ function renderTranscriptByFormat(transResult, transcriptFormat) {
   }
 
   return "";
+}
+
+function buildPlaudPatchPayload(transResult) {
+  const list = Array.isArray(transResult) ? transResult : [];
+  const speakerState = {
+    map: new Map(),
+    next: 1,
+  };
+
+  const extractExplicitIndex = (label) => {
+    const raw = String(label ?? "").trim();
+    if (!raw) return null;
+
+    let match = raw.match(/^SPEAKER\s*(\d+)$/i);
+    if (match?.[1]) {
+      const num = Number.parseInt(match[1], 10);
+      return Number.isFinite(num) ? Math.max(1, num) : null;
+    }
+
+    match = raw.match(/^Speaker\s*(\d+)$/i);
+    if (match?.[1]) {
+      const num = Number.parseInt(match[1], 10);
+      return Number.isFinite(num) ? Math.max(1, num) : null;
+    }
+
+    match =
+      raw.match(/^SPEAKER[_\s-]*(\d+)$/i) || raw.match(/^speaker[_\s-]*(\d+)$/i);
+    if (match?.[1]) {
+      const idx0 = Number.parseInt(match[1], 10);
+      return Number.isFinite(idx0) ? Math.max(1, idx0 + 1) : null;
+    }
+
+    return null;
+  };
+
+  for (const item of list) {
+    const explicit = extractExplicitIndex(item?.speaker);
+    if (explicit && explicit >= speakerState.next) {
+      speakerState.next = explicit + 1;
+    }
+  }
+
+  const toPlaudSpeakerStable = (label) => {
+    const raw = String(label ?? "").trim();
+    const explicit = extractExplicitIndex(raw);
+    if (explicit) {
+      if (explicit >= speakerState.next) {
+        speakerState.next = explicit + 1;
+      }
+      return `Speaker ${explicit}`;
+    }
+
+    if (!raw) return "Speaker 1";
+    const key = raw.toLowerCase();
+    const existing = speakerState.map.get(key);
+    if (existing) return `Speaker ${existing}`;
+
+    const assigned = speakerState.next;
+    speakerState.next += 1;
+    speakerState.map.set(key, assigned);
+    return `Speaker ${assigned}`;
+  };
+
+  return {
+    trans_result: list
+      .map((item) => ({
+        content: String(item?.content ?? "").trim(),
+        speaker: toPlaudSpeakerStable(item?.speaker),
+        end_time: Number(item?.end_time) || 0,
+        start_time: Number(item?.start_time) || 0,
+      }))
+      .filter((item) => item.content),
+  };
 }
 
 function shouldTryAnotherApiOrigin(error) {
@@ -2492,6 +3097,20 @@ class PlaudClient {
       throw new Error("temp_url field not found in PLAUD response");
     }
     return { tempUrl, requestUrl: resp.requestUrl, raw: resp.data };
+  }
+
+  async patchFileTranscript(fileId, transResult) {
+    const encoded = encodeURIComponent(String(fileId || "").trim());
+    const payload = buildPlaudPatchPayload(transResult);
+    if (!payload?.trans_result?.length) {
+      throw new Error("trans_result is empty; upload skipped.");
+    }
+    const resp = await this.requestJson({
+      method: "PATCH",
+      pathname: `/file/${encoded}`,
+      body: payload,
+    });
+    return { data: resp.data, requestUrl: resp.requestUrl, payload };
   }
 }
 
@@ -3456,6 +4075,35 @@ async function handleGetFileAudio(args) {
   };
 }
 
+async function handleUploadTranscriptFile(args) {
+  const fileId = pickNonEmptyString(args?.file_id, args?.fileId);
+  if (!fileId) throw new Error("Missing file_id");
+
+  const parsed = parseTranscriptUploadInput(args || {});
+  const client = getPlaudClient();
+  const patchResp = await client.patchFileTranscript(fileId, parsed.transResult);
+
+  const result = {
+    ok: true,
+    api_origin: client.apiOrigin,
+    file_id: fileId,
+    request_url: patchResp.requestUrl,
+    input_source: parsed.sourceType,
+    input_label: parsed.sourceLabel,
+    input_format_requested: parsed.requestedFormat,
+    input_format_detected: parsed.detectedFormat,
+    default_speaker: parsed.defaultSpeaker,
+    segment_count: parsed.transResult.length,
+    uploaded_segment_count: patchResp.payload.trans_result.length,
+  };
+
+  if (parsed.includeSegments) {
+    result.transcript_segments = parsed.transResult;
+  }
+
+  return result;
+}
+
 function buildToolTextResult(payload) {
   return {
     content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
@@ -3476,6 +4124,7 @@ async function executeToolCall(name, args) {
   if (name === TOOL_LIST_FILES) return handleListFiles(args || {});
   if (name === TOOL_GET_FILE_DATA) return handleGetFileData(args || {});
   if (name === TOOL_GET_FILE_AUDIO) return handleGetFileAudio(args || {});
+  if (name === TOOL_UPLOAD_TRANSCRIPT_FILE) return handleUploadTranscriptFile(args || {});
   throw new Error(`Unknown tool: ${name}`);
 }
 
