@@ -2983,6 +2983,7 @@ class PlaudClient {
       accept: "application/json",
       Authorization: `Bearer ${this.token}`,
       "edit-from": "web",
+      "user-agent": "plaud-mcp-server/0.1.0",
     };
     if (includeJsonBody) {
       headers["content-type"] = "application/json";
